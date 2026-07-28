@@ -1,0 +1,18 @@
+# ── 密钥 ──
+.env
+*.key
+*.pem
+
+# ── 公司资产（不推 GitHub）──
+knowledge/
+engine/
+
+# ── 运行时数据 ──
+data/cases/
+data/stats/
+
+# ── 通用 ──
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
