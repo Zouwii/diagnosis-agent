@@ -245,3 +245,41 @@ AGV 技术支持诊断 Agent。详见 docs/。
 | 04 | 多 Agent 协作设计 | 融合 vs 仲裁 + 代码文档 Agent + 现场 Agent | ⚠️ 通用部分双推，AGV 示例仅公司 |
 | 05 | 开发指南 | 本地运行、添加新节点、测试、调试 | ✅ 双推 |
 | 06 | 部署运维指南 | 服务器部署、Nginx、多实例、监控 | ❌ 仅公司 |
+
+---
+
+## 8. 跨仓库依赖与部署
+
+### 8.1 为什么能 import 其他仓库
+
+开发阶段通过 `PYTHONPATH` 环境变量让 Python 找到 jz-claude-skills：
+
+```bash
+# 本地开发
+export PYTHONPATH=/home/zhr/zhr_ws/src/ai/jz-claude-skills/skills/diagnosis-orchestrator/scripts:$PYTHONPATH
+python3 -m uvicorn server.main:app --port 5002
+```
+
+部署时 jz-claude-skills 作为依赖目录一同打包到 Docker 镜像，通过 Dockerfile 的 `ENV PYTHONPATH` 设置。
+
+### 8.2 部署架构
+
+```
+公司服务器
+    │
+    ├── /opt/diagnosis-agent/          # LangGraph 编排 + FastAPI
+    ├── /opt/jz-claude-skills/         # CLI + Playbook（只读依赖）
+    ├── /opt/management-system/        # RAG + 错误码 API（HTTP 调用）
+    │
+    └── PYTHONPATH 包含:
+        /opt/jz-claude-skills/skills/diagnosis-orchestrator/scripts
+```
+
+### 8.3 依赖关系
+
+```
+diagnosis-agent ──import──▶ jz-claude-skills (CLI 函数, Playbook 文件)
+diagnosis-agent ──HTTP───▶ management-system (RAG API, 错误码 API, Auth)
+```
+
+jz-claude-skills 对 diagnosis-agent 来说是**只读依赖**——只调它的函数，不改它的代码。
