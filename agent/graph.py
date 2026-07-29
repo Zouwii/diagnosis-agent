@@ -58,29 +58,47 @@ async def collect_data(state: DiagnosisState) -> DiagnosisState:
 
 
 async def classify_and_scan(state: DiagnosisState) -> DiagnosisState:
-    import re
+    """使用 engine.analysis.routing.classify_problem_type 做问题分类"""
+    from engine.analysis.routing import classify_problem_type, route_spec_for
+    from engine.analysis.material_scan import extract_error_codes
+
     symptom = state.get("symptom", state.get("user_input", ""))
-    for ptype, pattern in [
-        ("navigation_rotate", r"revolve|rotate|旋转"),
-        ("safety", r"安全|急停|避障"),
-        ("task_chain", r"任务|mission|task"),
-    ]:
-        if re.search(pattern, symptom, re.IGNORECASE):
-            state["problem_type"] = ptype
-            break
-    else:
-        state["problem_type"] = "general"
-    print(f"[node] classify_and_scan: problem_type={state['problem_type']}")
+    ptype = classify_problem_type(symptom, state.get("time_window", ""), state.get("source_type", "auto"))
+    state["problem_type"] = ptype
+
+    # 同时提取用户输入里可能提到的错误码
+    codes = extract_error_codes(state.get("user_input", ""))
+    if codes:
+        existing = state.get("error_codes", [])
+        state["error_codes"] = list(set(existing + codes))
+
+    print(f"[node] classify_and_scan: problem_type={ptype}, error_codes={state.get('error_codes', [])}")
     return state
 
 
 async def deep_insight_and_route(state: DiagnosisState) -> DiagnosisState:
-    # 模拟提取错误码（从 user_input 中找 6 开头的 6 位数字）
-    import re
-    codes = re.findall(r"(?<!\d)(6\d{5})(?!\d)", state.get("user_input", ""))
-    state["error_codes"] = codes
-    state["deep_insights"] = [{"rule": "mock", "hit": len(codes) > 0}]
-    print(f"[node] deep_insight_and_route: error_codes={codes}")
+    """使用 engine 的 build_deep_insights + build_specialty_findings"""
+    # 这些函数需要 case_dir 和文件——如果 materials 里没有路径，跳过
+    materials = state.get("materials", {})
+    case_dir = materials.get("case_dir", "")
+
+    if case_dir:
+        from pathlib import Path
+        from engine.analysis.deep_rules import build_deep_insights
+        from engine.analysis.insights import build_specialty_findings
+
+        insights = build_deep_insights(Path(case_dir), {}, state.get("findings", []))
+        specialty = build_specialty_findings(Path(case_dir), {}, state.get("findings", []))
+
+        state["deep_insights"] = insights
+        state["specialty_hits"] = [s.get("title", "") for s in specialty]
+    else:
+        state["deep_insights"] = []
+        state["specialty_hits"] = []
+
+    print(f"[node] deep_insight_and_route: error_codes={state.get('error_codes', [])}, "
+          f"insights={len(state.get('deep_insights', []))}, "
+          f"specialty={state.get('specialty_hits', [])}")
     return state
 
 

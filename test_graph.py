@@ -67,7 +67,7 @@ async def test_multi_agent_path():
     
     # 验证
     assert result.get("source_type") == "internal_robot", "source_type 应为 internal_robot"
-    assert result.get("error_codes") == [], "无错误码"
+    assert result.get("error_codes") in (None, []), "无错误码"
     assert result.get("arbitration_result") is not None, "应触发仲裁"
     assert result.get("conclusion_status") == "likely", "应输出结论"
     print("\n✅ 多 Agent 路径测试通过")
