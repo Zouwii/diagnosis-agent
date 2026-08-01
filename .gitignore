@@ -3,10 +3,6 @@
 *.key
 *.pem
 
-# ── 公司资产（不推任何远端）──
-knowledge/
-onsite/
-
 # ── 运行时数据 ──
 data/cases/
 data/stats/
@@ -20,3 +16,4 @@ __pycache__/
 # ── 通用 ──
 .venv/
 .DS_Store
+ai/config.json

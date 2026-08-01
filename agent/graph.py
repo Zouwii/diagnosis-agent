@@ -6,6 +6,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from agent.state import DiagnosisState
+from agent.logger import log
 
 
 # ────────────────────────────────────────────────────────────
@@ -35,25 +36,78 @@ def check_conflict(state: DiagnosisState) -> Literal["arbitrate", "render_report
 # ────────────────────────────────────────────────────────────
 
 async def identify_source(state: DiagnosisState) -> DiagnosisState:
-    print(f"[node] identify_source: input='{state.get('user_input', '')[:50]}'")
+    """四路来源识别。先确定性路由，失败则 LLM 追问"""
+    from agent.logger import log
+    from models.router import route, AllModelsExhausted
+
     params = state.get("extra_params", {})
+    user_input = state.get("user_input", "")
+
+    # ── 确定性路由 ──
     if params.get("task_url"):
         state["source_type"] = "tb_task"
-    elif params.get("robot_ip", "").startswith("172."):
+        log("identify_source", "确定性路由", source_type="tb_task",
+            task_url=params["task_url"][:40])
+        return state
+
+    if params.get("robot_ip", "").startswith("172."):
         state["source_type"] = "internal_robot"
-    elif params.get("frp_port"):
+        log("identify_source", "确定性路由", source_type="internal_robot",
+            ip=params["robot_ip"])
+        return state
+
+    if params.get("frp_port"):
         state["source_type"] = "remote_site"
-    elif params.get("log_path"):
+        log("identify_source", "确定性路由", source_type="remote_site",
+            port=params["frp_port"])
+        return state
+
+    if params.get("log_path"):
         state["source_type"] = "local_logs"
-    else:
+        log("identify_source", "确定性路由", source_type="local_logs",
+            path=params["log_path"][:50])
+        return state
+
+    # ── LLM 识别 ──
+    log("identify_source", "LLM识别", input=user_input[:80])
+
+    try:
+        result = await route("identify_source", [{
+            "role": "user",
+            "content": (
+                f"用户输入: {user_input}\n"
+                "判断问题来源，只回答以下之一: "
+                "internal_robot / tb_task / remote_site / local_logs / insufficient_data\n"
+            )
+        }])
+        answer = result["content"].strip().lower()
+        log("identify_source", "LLM结果", answer=answer, model=result["model"])
+
+        # 映射 LLM 回答到 source_type
+        source_map = {
+            "internal_robot": "internal_robot",
+            "tb_task": "tb_task",
+            "remote_site": "remote_site",
+            "local_logs": "local_logs",
+        }
+        for key, val in source_map.items():
+            if key in answer:
+                state["source_type"] = val
+                return state
+
         state["source_type"] = "insufficient_data"
-    print(f"[node] identify_source: source_type={state['source_type']}")
+    except AllModelsExhausted:
+        state["source_type"] = "insufficient_data"
+        log("identify_source", "模型不可用", error="all_models_exhausted")
+
     return state
 
 
+
 async def collect_data(state: DiagnosisState) -> DiagnosisState:
-    print(f"[node] collect_data: source_type={state.get('source_type')}")
+    log("collect_data", "采集开始", source_type=state.get("source_type", "?"))
     state["materials"] = {"collected": True, "source": state.get("source_type")}
+    log("collect_data", "采集完成（mock）", source=state.get("source_type", "?"))
     return state
 
 
@@ -72,7 +126,7 @@ async def classify_and_scan(state: DiagnosisState) -> DiagnosisState:
         existing = state.get("error_codes", [])
         state["error_codes"] = list(set(existing + codes))
 
-    print(f"[node] classify_and_scan: problem_type={ptype}, error_codes={state.get('error_codes', [])}")
+    log("classify_and_scan", "分类完成", problem_type=ptype, error_codes=state.get("error_codes", []))
     return state
 
 
@@ -96,52 +150,140 @@ async def deep_insight_and_route(state: DiagnosisState) -> DiagnosisState:
         state["deep_insights"] = []
         state["specialty_hits"] = []
 
-    print(f"[node] deep_insight_and_route: error_codes={state.get('error_codes', [])}, "
-          f"insights={len(state.get('deep_insights', []))}, "
-          f"specialty={state.get('specialty_hits', [])}")
+    log("deep_insight_and_route", "归因完成", error_codes=state.get("error_codes", []),
+          insights_count=len(state.get("deep_insights", [])),
+          specialty=state.get("specialty_hits", []))
     return state
 
 
 async def error_code_worker(state: DiagnosisState) -> DiagnosisState:
+    """使用 knowledge.playbook_loader 执行 Playbook"""
+    from knowledge.playbook_loader import execute_playbook
+
     codes = state.get("error_codes", [])
-    state["playbook_matched"] = len(codes) > 0
-    state["playbook_error_code"] = codes[0] if codes else ""
-    state["playbook_root_cause"] = f"mock root cause for {codes[0]}" if codes else ""
-    state["playbook_confidence"] = "medium"
-    print(f"[node] error_code_worker: matched={state['playbook_matched']}")
+    if not codes:
+        state["playbook_matched"] = False
+        return state
+
+    # 取第一个错误码（错误码关联图排序后，上游优先）
+    code = codes[0]
+
+    # 收集可用日志文本
+    log_text = ""
+    findings = state.get("findings", [])
+    if findings:
+        log_text = "\n".join(f.get("text", "") for f in findings[:20])
+    elif state.get("user_input"):
+        log_text = state.get("user_input", "")
+
+    result = execute_playbook(code, log_text)
+
+    state["playbook_matched"] = result["matched"]
+    state["playbook_error_code"] = code
+    state["playbook_trigger_chain"] = result.get("trigger_chain", "")
+    state["playbook_root_cause"] = result.get("root_cause", "")
+    state["playbook_confidence"] = result.get("confidence", "low")
+
+    log("error_code_worker", "Playbook执行", code=code, matched=result["matched"],
+        trigger_chain=result.get("trigger_chain", "?"), confidence=result.get("confidence", "?"))
     return state
 
 
-async def history_worker_fusion(state: DiagnosisState) -> DiagnosisState:
-    state["history_cases"] = [{"case_id": "mock-001", "score": 5, "conclusion": "mock"}]
-    print(f"[node] history_worker_fusion: found {len(state['history_cases'])} cases")
+async def topk_doc_worker(state: DiagnosisState) -> DiagnosisState:
+    """使用导航 TopK 问题文档做文档匹配"""
+    from agent.logger import log
+    from knowledge.topk_loader import match_problem_doc
+
+    code = state.get("playbook_error_code", "")
+    problem_type = state.get("problem_type", "general")
+
+    result = match_problem_doc(code, problem_type, state.get("symptom", ""))
+
+    state["topk_doc_result"] = result
+    log("topk_doc_worker", "文档匹配完成",
+        code=code, problem_type=problem_type,
+        matched=result.get("matched", False),
+        relevance=result.get("relevance", "none"))
+
     return state
 
 
 async def fuse_simple(state: DiagnosisState) -> DiagnosisState:
-    state["fusion_result"] = {
-        "status": "consistent",
-        "root_cause": state.get("playbook_root_cause", ""),
-        "confidence": "medium",
-    }
-    state["fused_root_cause"] = state.get("playbook_root_cause", "")
-    state["fused_confidence"] = "medium"
-    print(f"[node] fuse_simple: {state['fusion_result']['status']}")
+    """融合 Playbook 结论和 TopK 文档结论 —— 一次 LLM 调用"""
+    from agent.logger import log
+    from models.router import route, AllModelsExhausted
+
+    playbook_cause = state.get("playbook_root_cause", "")
+    playbook_chain = state.get("playbook_trigger_chain", "")
+    topk_section = state.get("topk_doc_result", {}).get("section", "")
+    topk_directions = state.get("topk_doc_result", {}).get("directions", [])
+    symptom = state.get("symptom", state.get("user_input", ""))
+
+    if not playbook_cause and not topk_section:
+        state["fusion_result"] = {"status": "insufficient", "root_cause": "", "confidence": "low"}
+        state["fused_root_cause"] = ""
+        state["fused_confidence"] = "low"
+        log("fuse_simple", "无可用结论，跳过融合")
+        return state
+
+    prompt = f"""你是诊断融合器。两个分析路径给出了各自的结论，判断它们是否一致。
+
+现象: {symptom}
+
+路径A (代码分析):
+  触发链: {playbook_chain}
+  根因: {playbook_cause}
+
+路径B (文档匹配):
+  问题分类: {topk_section}
+  排查方向: {', '.join(topk_directions) if topk_directions else '无'}
+
+请输出 JSON:
+{{"relation": "一致|上下游|矛盾|互补", "fused_cause": "融合后的根因描述", "confidence": "high|medium|low"}}"""
+
+    try:
+        result = await route("fuse_simple", [{"role": "user", "content": prompt}])
+        import json, re
+        json_match = re.search(r'\{.*\}', result["content"], re.DOTALL)
+        if json_match:
+            fusion = json.loads(json_match.group(0))
+        else:
+            fusion = {"relation": "未知", "fused_cause": result["content"][:200], "confidence": "low"}
+
+        state["fusion_result"] = {
+            "status": fusion.get("relation", "未知"),
+            "root_cause": fusion.get("fused_cause", ""),
+            "confidence": fusion.get("confidence", "low"),
+        }
+        state["fused_root_cause"] = fusion.get("fused_cause", "")
+        state["fused_confidence"] = fusion.get("confidence", "low")
+
+        log("fuse_simple", "融合完成",
+            relation=fusion.get("relation", "?"),
+            confidence=fusion.get("confidence", "?"),
+            model=result["model"])
+
+    except AllModelsExhausted:
+        state["fusion_result"] = {"status": "error", "root_cause": playbook_cause or topk_section, "confidence": "low"}
+        state["fused_root_cause"] = playbook_cause or topk_section
+        state["fused_confidence"] = "low"
+        log("fuse_simple", "模型不可用，使用原始结论")
+
     return state
 
 
 async def doc_agent(state: DiagnosisState) -> DiagnosisState:
-    print(f"[node] doc_agent: analyzing...")
+    log("doc_agent", "开始分析（mock）")
     return {"doc_agent_result": {"root_cause": "mock_doc_cause", "confidence": "medium"}}
 
 
 async def field_agent(state: DiagnosisState) -> DiagnosisState:
-    print(f"[node] field_agent: analyzing...")
+    log("field_agent", "开始分析（mock）")
     return {"field_agent_result": {"root_cause": "mock_field_cause", "confidence": "medium"}}
 
 
 async def arbitrate(state: DiagnosisState) -> DiagnosisState:
-    print(f"[node] arbitrate: resolving conflict...")
+    log("arbitrate", "开始仲裁（mock）")
     return {"arbitration_result": {
         "conflict_type": "real",
         "primary_conclusion": state.get("field_agent_result", {}).get("root_cause", ""),
@@ -153,7 +295,7 @@ async def arbitrate(state: DiagnosisState) -> DiagnosisState:
 
 
 async def render_report(state: DiagnosisState) -> DiagnosisState:
-    print(f"[node] render_report: finalizing...")
+    log("render_report", "报告生成完成（mock）")
     return {"conclusion_status": "likely", "report_path": "data/cases/mock/report.md"}
 
 
@@ -186,10 +328,10 @@ def build_graph() -> StateGraph:
 
     # 融合路径
     graph.add_node("error_code_worker", error_code_worker)
-    graph.add_node("history_worker_fusion", history_worker_fusion)
+    graph.add_node("topk_doc_worker", topk_doc_worker)
     graph.add_node("fuse_simple", fuse_simple)
     graph.add_edge("error_code_worker", "fuse_simple")
-    graph.add_edge("history_worker_fusion", "fuse_simple")
+    graph.add_edge("topk_doc_worker", "fuse_simple")
     graph.add_edge("fuse_simple", "render_report")
 
     # 多 Agent 路径：扇出节点，同时启动 doc_agent 和 field_agent

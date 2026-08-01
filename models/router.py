@@ -20,44 +20,44 @@ from litellm.exceptions import APIError, RateLimitError, Timeout
 
 MODEL_CONFIG = {
     "identify_source": {
-        "model": os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat"),
-        "fallbacks": ["zhipu/glm-4"],
+        "model": os.getenv("DEFAULT_MODEL", "openai/deepseek-v4-flash"),
+        "fallbacks": ["openai/glm-4"],
         "max_tokens": 100,
         "temperature": 0.1,
     },
     "playbook_fallback": {
-        "model": os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat"),
-        "fallbacks": ["zhipu/glm-4"],
+        "model": os.getenv("DEFAULT_MODEL", "openai/deepseek-v4-flash"),
+        "fallbacks": ["openai/glm-4"],
         "max_tokens": 200,
         "temperature": 0.1,
     },
     "doc_agent": {
-        "model": os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat"),
-        "fallbacks": ["zhipu/glm-4"],
+        "model": os.getenv("DEFAULT_MODEL", "openai/deepseek-v4-flash"),
+        "fallbacks": ["openai/glm-4"],
         "max_tokens": 300,
         "temperature": 0.2,
     },
     "field_agent": {
-        "model": os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat"),
-        "fallbacks": ["zhipu/glm-4"],
+        "model": os.getenv("DEFAULT_MODEL", "openai/deepseek-v4-flash"),
+        "fallbacks": ["openai/glm-4"],
         "max_tokens": 200,
         "temperature": 0.2,
     },
     "fuse_simple": {
-        "model": os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat"),
-        "fallbacks": ["zhipu/glm-4"],
+        "model": os.getenv("DEFAULT_MODEL", "openai/deepseek-v4-flash"),
+        "fallbacks": ["openai/glm-4"],
         "max_tokens": 300,
         "temperature": 0.2,
     },
     "arbitrate": {
-        "model": os.getenv("STRONG_MODEL", "anthropic/claude-sonnet-4-20250514"),
-        "fallbacks": ["zhipu/glm-4-plus"],
+        "model": os.getenv("STRONG_MODEL", "openai/claude-sonnet-4-20250514"),
+        "fallbacks": ["openai/glm-4-plus"],
         "max_tokens": 500,
         "temperature": 0.3,
     },
     "format_draft": {
-        "model": os.getenv("DEFAULT_MODEL", "deepseek/deepseek-chat"),
-        "fallbacks": ["zhipu/glm-4"],
+        "model": os.getenv("DEFAULT_MODEL", "openai/deepseek-v4-flash"),
+        "fallbacks": ["openai/glm-4"],
         "max_tokens": 300,
         "temperature": 0.3,
     },
@@ -114,11 +114,17 @@ async def route(task: str, messages: list[dict], **kwargs) -> dict:
 
 async def _call(model: str, messages: list[dict], max_tokens: int, temperature: float) -> dict:
     """调用 LiteLLM，返回结构化结果"""
+    kwargs = {}
+    if _one_api:
+        kwargs["api_key"] = _one_api.get("api_key")
+        kwargs["api_base"] = _one_api.get("base_url") + "/v1"
+
     response = completion(
         model=model,
         messages=messages,
         max_tokens=max_tokens,
         temperature=temperature,
+        **kwargs,
     )
     return {
         "content": response.choices[0].message.content,
@@ -146,3 +152,24 @@ def _estimate_cost(model: str, usage) -> float:
 class AllModelsExhausted(Exception):
     """所有模型（含 fallback）都不可用"""
     pass
+
+
+# ────────────────────────────────────────────────────────────
+# One-API 代理配置（从 ai/config.json 读取）
+# ────────────────────────────────────────────────────────────
+
+import json
+from pathlib import Path
+
+def _load_one_api_config() -> dict | None:
+    config_path = Path(__file__).resolve().parent.parent / "ai" / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            return json.load(f)
+    return None
+
+_one_api = _load_one_api_config()
+if _one_api:
+    import os
+    os.environ.setdefault("OPENAI_API_KEY", _one_api.get("api_key", ""))
+    os.environ.setdefault("OPENAI_API_BASE", _one_api.get("base_url", "") + "/v1")

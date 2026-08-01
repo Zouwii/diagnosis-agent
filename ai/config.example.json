@@ -1,0 +1,5 @@
+{
+  "api_key": "sk-your-key",
+  "base_url": "http://one-api.server22.jz",
+  "model": "deepseek-v4-flash"
+}
