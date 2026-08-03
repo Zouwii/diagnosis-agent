@@ -1,11 +1,11 @@
-"""Playbook 加载器 —— 从 nav-manager 仓库读取 54 个错误码 Playbook"""
+"""Playbook 加载器 —— 读取本仓库自动生成的 Agent 错误码文档"""
 
 import re, yaml
 from pathlib import Path
 from typing import Any
 
 # Playbook 文档所在目录
-PLAYBOOK_DIR = Path("/home/zhr/zhr_ws/src/mainbody/nav-manager/docs/jstate_error_codes/nav-navigation-errors")
+PLAYBOOK_DIR = Path(__file__).resolve().parents[1] / 'source-docs' / 'jstate_error_codes' / 'agent'
 
 
 def load_playbook(error_code: str) -> dict | None:
@@ -128,7 +128,7 @@ def list_available_codes() -> list[str]:
     codes = []
     for path in PLAYBOOK_DIR.glob("*.md"):
         code = path.name.split("-")[0]
-        if code.isdigit():
+        if code.isdigit() and load_playbook(code):
             codes.append(code)
     return sorted(codes)
 
