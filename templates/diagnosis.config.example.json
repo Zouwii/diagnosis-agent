@@ -1,0 +1,21 @@
+{
+  "source": "auto",
+  "task_url": "",
+  "ip": "172.22.0.222",
+  "frp_port": "",
+  "robot_ip": "",
+  "log_path": "",
+  "symptom": "昨天晚上任务卡住，前端显示任务执行中但车没动",
+  "time_window": "昨天晚上",
+  "knowledge_sources": [
+    "钉钉知识库目录或文档链接"
+  ],
+  "code_sources": [
+    "GitLab 仓库、MR、Issue 或本地代码路径"
+  ],
+  "artifacts": [],
+  "case_id": "",
+  "case_root": "./data/cases",
+  "force": false,
+  "external_evidence": true
+}

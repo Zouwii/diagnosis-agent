@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Diagnosis Agent</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f4f6f8; color: #17202a; }
+    main { width: min(920px, calc(100% - 32px)); margin: 32px auto; }
+    header { margin-bottom: 20px; }
+    h1 { margin: 0 0 6px; font-size: 26px; }
+    .subtle { color: #64748b; font-size: 14px; }
+    .card { background: #fff; border: 1px solid #dfe5ec; border-radius: 12px; padding: 20px; margin-bottom: 16px; box-shadow: 0 4px 18px rgba(15, 23, 42, .04); }
+    .grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .full { grid-column: 1 / -1; }
+    label { display: grid; gap: 6px; font-size: 14px; font-weight: 600; }
+    input, select, textarea, button { font: inherit; }
+    input, select, textarea { width: 100%; border: 1px solid #cbd5e1; border-radius: 8px; padding: 10px 12px; background: #fff; }
+    textarea { min-height: 92px; resize: vertical; }
+    input:focus, select:focus, textarea:focus { outline: 2px solid #bfdbfe; border-color: #2563eb; }
+    button { border: 0; border-radius: 8px; padding: 10px 18px; cursor: pointer; background: #2563eb; color: #fff; font-weight: 700; }
+    button.secondary { background: #e2e8f0; color: #334155; }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; }
+    .mode-fields { display: contents; }
+    .hidden { display: none !important; }
+    .status-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .badge { display: inline-block; border-radius: 999px; padding: 4px 10px; background: #e2e8f0; font-size: 13px; font-weight: 700; }
+    .badge.running { background: #dbeafe; color: #1d4ed8; }
+    .badge.success { background: #dcfce7; color: #15803d; }
+    .badge.error { background: #fee2e2; color: #b91c1c; }
+    #events { margin: 14px 0 0; padding-left: 22px; color: #475569; font-size: 14px; line-height: 1.75; }
+    #message { min-height: 20px; color: #475569; font-size: 14px; }
+    #message.error { color: #b91c1c; }
+    pre { margin: 14px 0 0; padding: 16px; border-radius: 8px; background: #0f172a; color: #e2e8f0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 560px; overflow: auto; }
+    @media (max-width: 680px) { .grid { grid-template-columns: 1fr; } .full { grid-column: auto; } main { margin-top: 18px; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Diagnosis Agent</h1>
+    <div class="subtle">选择材料来源，提交后由独立 Worker 完成采集和诊断。</div>
+  </header>
+
+  <section class="card">
+    <form id="case-form">
+      <div class="grid">
+        <label>
+          诊断模式
+          <select id="mode" name="mode">
+            <option value="internal_robot">公司内网机器人</option>
+            <option value="tb_task">Teambition 任务</option>
+            <option value="remote_site">客户现场远程</option>
+            <option value="local_logs">本地日志</option>
+          </select>
+        </label>
+
+        <div class="mode-fields" data-mode="internal_robot">
+          <label>机器人 IP<input id="robot-ip" placeholder="172.22.0.222"></label>
+        </div>
+        <div class="mode-fields hidden" data-mode="tb_task">
+          <label>TB 任务链接<input id="task-url" placeholder="https://www.teambition.com/task/..."></label>
+        </div>
+        <div class="mode-fields hidden" data-mode="remote_site">
+          <label>FRP 端口<input id="frp-port" type="number" min="1" max="65535" placeholder="32001"></label>
+          <label>现场机器人 IP<input id="site-robot-ip" placeholder="192.168.1.100"></label>
+        </div>
+        <div class="mode-fields hidden" data-mode="local_logs">
+          <label>上传日志或压缩包<input id="log-file" type="file"></label>
+          <label>服务器工作区路径（与上传二选一）<input id="log-path" placeholder="当前用户工作区内的路径"></label>
+        </div>
+
+        <label class="full">问题现象<textarea id="symptom" required placeholder="请描述问题表现，例如：到点后旋转三圈停止"></textarea></label>
+        <label>问题时间<input id="time-window" placeholder="2026-08-03 10:00 或 昨天晚上"></label>
+      </div>
+      <div class="actions">
+        <button id="submit" type="submit">开始诊断</button>
+        <span id="message"></span>
+      </div>
+    </form>
+  </section>
+
+  <section id="progress-card" class="card hidden">
+    <div class="status-row">
+      <div>
+        <strong>诊断进度</strong>
+        <div id="case-id" class="subtle"></div>
+      </div>
+      <span id="status" class="badge">pending</span>
+    </div>
+    <ol id="events"></ol>
+    <div class="actions">
+      <button id="report-button" type="button" class="secondary hidden">查看报告</button>
+    </div>
+    <pre id="report" class="hidden"></pre>
+  </section>
+</main>
+
+<script>
+  const form = document.querySelector('#case-form');
+  const mode = document.querySelector('#mode');
+  const submit = document.querySelector('#submit');
+  const message = document.querySelector('#message');
+  const progressCard = document.querySelector('#progress-card');
+  const caseIdText = document.querySelector('#case-id');
+  const statusBadge = document.querySelector('#status');
+  const events = document.querySelector('#events');
+  const reportButton = document.querySelector('#report-button');
+  const report = document.querySelector('#report');
+  let activeCase = null;
+  let eventSource = null;
+
+  mode.addEventListener('change', () => {
+    document.querySelectorAll('[data-mode]').forEach((node) => {
+      node.classList.toggle('hidden', node.dataset.mode !== mode.value);
+    });
+  });
+
+  function setMessage(text, isError = false) {
+    message.textContent = text;
+    message.classList.toggle('error', isError);
+  }
+
+  async function api(url, options = {}) {
+    const response = await fetch(url, { credentials: 'include', ...options });
+    if (!response.ok) {
+      let detail = `请求失败 (${response.status})`;
+      try {
+        const body = await response.json();
+        detail = body.detail || detail;
+      } catch (_) {}
+      if (response.status === 401) detail += '，请先登录 management-system';
+      throw new Error(detail);
+    }
+    return response;
+  }
+
+  function setStatus(value) {
+    statusBadge.textContent = value || 'unknown';
+    statusBadge.className = 'badge';
+    if (['pending', 'collecting', 'analyzing'].includes(value)) statusBadge.classList.add('running');
+    if (value === 'closed') statusBadge.classList.add('success');
+    if (value === 'failed') statusBadge.classList.add('error');
+  }
+
+  function addEvent(text) {
+    const item = document.createElement('li');
+    item.textContent = text;
+    events.appendChild(item);
+  }
+
+  async function uploadIfNeeded() {
+    const file = document.querySelector('#log-file').files[0];
+    if (!file) return null;
+    setMessage(`正在上传 ${file.name}…`);
+    const body = new FormData();
+    body.append('file', file);
+    const response = await api('/api/cases/uploads', { method: 'POST', body });
+    return (await response.json()).upload_id;
+  }
+
+  function requestBody(uploadId) {
+    const selectedMode = mode.value;
+    const body = {
+      mode: selectedMode,
+      symptom: document.querySelector('#symptom').value.trim(),
+      time_window: document.querySelector('#time-window').value.trim() || null,
+      knowledge_sources: [],
+      code_sources: [],
+    };
+    if (selectedMode === 'internal_robot') body.robot_ip = document.querySelector('#robot-ip').value.trim();
+    if (selectedMode === 'tb_task') body.task_url = document.querySelector('#task-url').value.trim();
+    if (selectedMode === 'remote_site') {
+      body.frp_port = Number(document.querySelector('#frp-port').value);
+      body.site_robot_ip = document.querySelector('#site-robot-ip').value.trim();
+    }
+    if (selectedMode === 'local_logs') {
+      if (uploadId) body.upload_id = uploadId;
+      else body.log_path = document.querySelector('#log-path').value.trim();
+    }
+    return body;
+  }
+
+  async function refreshCase() {
+    if (!activeCase) return;
+    const response = await api(`/api/cases/${encodeURIComponent(activeCase)}`);
+    const current = await response.json();
+    setStatus(current.status);
+    if (current.error) addEvent(`失败：${current.error}`);
+    if (current.report_url) reportButton.classList.remove('hidden');
+  }
+
+  function watchCase(caseId) {
+    if (eventSource) eventSource.close();
+    eventSource = new EventSource(`/api/cases/${encodeURIComponent(caseId)}/stream`, { withCredentials: true });
+    eventSource.onmessage = (event) => addEvent(event.data);
+    eventSource.addEventListener('done', async (event) => {
+      setStatus(event.data);
+      eventSource.close();
+      await refreshCase();
+      submit.disabled = false;
+    });
+    eventSource.onerror = async () => {
+      eventSource.close();
+      try { await refreshCase(); } catch (error) { setMessage(error.message, true); }
+      submit.disabled = false;
+    };
+  }
+
+  form.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    submit.disabled = true;
+    report.classList.add('hidden');
+    reportButton.classList.add('hidden');
+    events.replaceChildren();
+    setMessage('正在创建诊断任务…');
+    try {
+      const uploadId = mode.value === 'local_logs' ? await uploadIfNeeded() : null;
+      const response = await api('/api/cases', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(requestBody(uploadId)),
+      });
+      const created = await response.json();
+      activeCase = created.case_id;
+      progressCard.classList.remove('hidden');
+      caseIdText.textContent = created.case_id;
+      setStatus(created.status);
+      setMessage('任务已提交，可离开页面，后台会继续执行。');
+      watchCase(created.case_id);
+    } catch (error) {
+      setMessage(error.message, true);
+      submit.disabled = false;
+    }
+  });
+
+  reportButton.addEventListener('click', async () => {
+    if (!activeCase) return;
+    try {
+      const response = await api(`/api/cases/${encodeURIComponent(activeCase)}/report`);
+      report.textContent = await response.text();
+      report.classList.remove('hidden');
+    } catch (error) {
+      setMessage(error.message, true);
+    }
+  });
+</script>
+</body>
+</html>

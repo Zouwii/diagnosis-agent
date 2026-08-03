@@ -63,7 +63,7 @@ knowledge/
 engine/
 
 # ── 运行时数据（不推任何远端）──
-data/cases/
+data/tenants/{owner_safe}/cases/
 data/stats/
 
 # ── 通用忽略 ──
@@ -172,7 +172,11 @@ ERROR_CODE_API_URL=http://management-system:5001/api/error-codes
 CLI_PATH=../jz-claude-skills/scripts/diagnosis_cli.py
 
 # ── 服务端口 ──
-PORT=5002
+PORT=6001
+MANAGEMENT_SYSTEM_URL=http://127.0.0.1:5002
+DIAGNOSIS_STORAGE_ROOT=/var/lib/diagnosis-agent
+DIAGNOSIS_INTERNAL_TOKEN=replace-with-a-long-random-secret
+DIAGNOSIS_ALLOW_ANONYMOUS=false
 ```
 
 ### 5.2 .env（不提交）
@@ -205,7 +209,7 @@ A multi-agent diagnostic system built with LangGraph + LiteLLM + FastAPI.
 
 ## Quick Start
 pip install -r requirements.txt
-python -m uvicorn server.main:app --port 5002
+python -m uvicorn server.main:app --port 6001
 
 ## Docs
 - [Architecture Overview](docs/01-架构概览.md)
@@ -223,7 +227,7 @@ AGV 技术支持诊断 Agent。详见 docs/。
 ## 部署
 1. 复制 .env.example → .env，填入真实 Key
 2. pip install -r requirements.txt
-3. python -m uvicorn server.main:app --port 5002
+3. python -m uvicorn server.main:app --port 6001
 
 ## 文档
 - [Git 策略](docs/00-项目初始化与Git策略.md)
@@ -257,7 +261,7 @@ AGV 技术支持诊断 Agent。详见 docs/。
 ```bash
 # 本地开发
 export PYTHONPATH=/home/zhr/zhr_ws/src/ai/jz-claude-skills/skills/diagnosis-orchestrator/scripts:$PYTHONPATH
-python3 -m uvicorn server.main:app --port 5002
+python3 -m uvicorn server.main:app --port 6001
 ```
 
 部署时 jz-claude-skills 作为依赖目录一同打包到 Docker 镜像，通过 Dockerfile 的 `ENV PYTHONPATH` 设置。
