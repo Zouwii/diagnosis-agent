@@ -27,7 +27,7 @@ diagnosis-agent/
 │   └── nodes/             各节点实现 (逐步实现)
 ├── models/
 │   └── router.py          LiteLLM 模型路由层
-├── engine/                CLI 集成 (调 jz-claude-skills)
+├── engine/                模块化诊断引擎（全量迁移自 diagnosis-orchestrator）
 ├── knowledge/             领域知识 (Playbook + 关联图)
 ├── data/                  开发环境运行时数据
 │   ├── tenants/{owner}/   租户隔离的 uploads/ 和 cases/
@@ -175,6 +175,15 @@ CLI Engine：采集、确定性日志分析、时间窗处理、外部证据补�
 `POST /api/cases/uploads`，再把返回的 `upload_id` 传给创建 Case 接口。
 
 ## 文档
+
+| 编号 | 文档 | 说明 |
+|---|---|---|
+| 01 | [架构说明](docs/01-架构说明.md) | FastAPI + Worker + LangGraph 单节点 + 模块化 engine |
+| 02 | [开发任务](docs/02-开发任务.md) | 稳定任务编号，Now / Later 分列 |
+| 03 | [source-docs 索引](docs/03-source-docs索引.md) | 知识源资产及生成方式 |
+| 05 | [开发指南](docs/05-开发指南.md) | 本地运行、测试、开发手册 |
+| 06 | [高频导航问题知识建设任务](docs/06-高频导航问题知识建设任务.md) | 知识建设专项任务 |
+| — | [历史归档](docs/archive/) | 已过时的历史设计方案 |
 
 - PRD: [../pm-learning/jz-product/05-技术支持诊断Agent-PRD.md](../pm-learning/jz-product/05-技术支持诊断Agent-PRD.md)
 - 系统架构: [../pm-learning/jz-product/07-技术支持诊断Agent-系统架构设计.md](../pm-learning/jz-product/07-技术支持诊断Agent-系统架构设计.md)

@@ -1,57 +1,89 @@
 #!/usr/bin/env python3
-"""
-Q2 现场问题分类统计脚本
-数据源：远程 MySQL onsite_problem 数据库（172.19.3.79 via SSH tunnel）
-输出：Markdown 复盘报告
-"""
+"""onsite-top 数据整理工具：生成现场问题报告，或迁移 raw_json 字段。"""
 
-import json, re, sys
+import argparse
+import json, os, re, sys
 from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 
-# SSH tunnel: sshpass -p '1' ssh -fN -L 3307:127.0.0.1:3306 jz@172.19.3.79
-DB_CONFIG = {
-    "host": "127.0.0.1", "port": 3307,
-    "user": "root", "password": "123456",
-    "database": "onsite_problem", "charset": "utf8mb4",
+DEFAULT_EXECUTORS = {
+    "onsite": {"潘峥": "61dce1a3bd146ff52e5624d7", "panzheng": "61dce1a3bd146ff52e5624d7"},
+    "benti": {"潘峥": "2108411066921750", "panzheng": "2108411066921750"},
 }
+DB_NAMES = {"benti": "benti_management", "onsite": "onsite_problem"}
+TABLES = {
+    # CLI 名称                 数据库来源       实际表名                 时间字段
+    "program_issue_details": ("benti", "program_issue_detail", "created_at_ding"),
+    "onsite_problem": ("onsite", "onsite_problem_details", "ding_created"),
+}
+QUARTERS = {"Q1": ("01-01", "04-01"), "Q2": ("04-01", "07-01"),
+            "Q3": ("07-01", "10-01"), "Q4": ("10-01", "01-01")}
 
-def get_db_connection():
+def db_config(source):
+    """按来源读取连接配置；密码优先从环境变量读取。"""
+    prefix = source.upper()
+    return {
+        "host": os.getenv(f"{prefix}_DB_HOST", "127.0.0.1"),
+        "port": int(os.getenv(f"{prefix}_DB_PORT", "3307")),
+        "user": os.getenv(f"{prefix}_DB_USER", "root"),
+        "password": os.getenv(f"{prefix}_DB_PASSWORD", ""),
+        "database": os.getenv(f"{prefix}_DB_NAME", DB_NAMES[source]),
+        "charset": "utf8mb4",
+    }
+
+def get_db_connection(source):
     try:
         import pymysql
-        return pymysql.connect(**DB_CONFIG)
+        return pymysql.connect(**db_config(source))
     except Exception as e:
-        print(f"[WARN] DB: {e}, fallback to markdown", file=sys.stderr)
-        return None
+        raise RuntimeError(f"{source} 数据库连接失败: {e}") from e
 
-def fetch_from_db(conn, s="2026-04-01", e="2026-07-01",
-                   executor_id="61dce1a3bd146ff52e5624d7"):
-    """从远程 onsite_problem_details 拉取潘铮 Q2 数据"""
+def quarter_dates(year, quarter):
+    if quarter not in QUARTERS:
+        raise ValueError(f"不支持的季度: {quarter}，可选 Q1/Q2/Q3/Q4")
+    start, end = QUARTERS[quarter]
+    start_year = year
+    end_year = year + (1 if quarter == "Q4" else 0)
+    return f"{start_year}-{start}", f"{end_year}-{end}"
+
+def fetch_from_db(conn, table_key, s, e, executor_id):
+    """按表结构查询指定人员和季度；两个表缺失的字段统一补 NULL。"""
+    _source, table_name, date_column = TABLES[table_key]
     c = conn.cursor()
-    c.execute("""
-    SELECT task_id, content, problem_description, problem_category, problem_module,
-           root_cause, solution, vehicle_model, occurrence_frequency,
-           software_version, is_done, due_date
-    FROM onsite_problem_details
-    WHERE due_date >= %s AND due_date < %s
-      AND executor_id = %s
-    ORDER BY due_date""", (s, e, executor_id))
+    c.execute(f"SHOW COLUMNS FROM `{table_name}`")
+    columns = {row[0] for row in c.fetchall()}
+    def field(name, alias=None):
+        alias = alias or name
+        return f"`{name}` AS `{alias}`" if name in columns else f"NULL AS `{alias}`"
+    raw_field = "raw_json" if "raw_json" in columns else "custom_fields_json"
+    selects = [field(name) for name in (
+        "task_id", "content", "problem_description", "problem_category", "problem_module",
+        "root_cause", "solution", "vehicle_model", "occurrence_frequency", "software_version",
+        "is_done")]
+    selects += [field(date_column, "due_date"), field(raw_field, "raw_json")]
+    where = f"WHERE `{date_column}` >= %s AND `{date_column}` < %s"
+    params = [s, e]
+    if "executor_id" in columns:
+        where += " AND `executor_id` = %s"; params.append(executor_id)
+    c.execute(f"SELECT {', '.join(selects)} FROM `{table_name}` {where} ORDER BY `{date_column}`", params)
     rows = c.fetchall(); c.close()
     result = []
     for i, r in enumerate(rows, 1):
+        raw = r[12]
+        extracted = parse_raw_json(raw) if raw else {}
         result.append({
             "num": i,
             "date": str(r[11])[:10] if r[11] else "",
-            "description": (r[2] or r[1] or "").strip(),
+            "description": (r[2] or r[1] or extracted.get("problem_description") or "").strip(),
             "vehicle_model": r[7] or "",
             "status": "done" if r[10] else "pending",
             "root_cause_text": r[5] or "",
             "solution_text": r[6] or "",
-            "problem_category": r[3] or "",
-            "problem_module": r[4] or "",
+            "problem_category": r[3] or extracted.get("problem_category", ""),
+            "problem_module": r[4] or extracted.get("problem_module", ""),
             "occurrence_frequency": r[8] or "",
-            "software_version": r[9] or "",
+            "software_version": r[9] or extracted.get("software_version", ""),
         })
     return result
 
@@ -550,7 +582,7 @@ def classify_all(records: list) -> dict:
 def fmtpct(cnt, total):
     return f"{cnt/total*100:.2f}%" if total else "0.00%"
 
-def generate_report(stats: dict, source: str = "") -> str:
+def generate_legacy_report(stats: dict, source: str = "") -> str:
     total = stats["total"]
     tc = stats["type_counter"]
     nav_total = tc.get("导航", 0)
@@ -685,62 +717,233 @@ def generate_report(stats: dict, source: str = "") -> str:
 
     return "\n".join(L)
 
+def markdown_table(headers, rows):
+    lines = ["| " + " | ".join(headers) + " |",
+             "|" + "|".join("---" for _ in headers) + "|"]
+    lines.extend("| " + " | ".join(str(v) for v in row) + " |" for row in rows)
+    return "\n".join(lines)
+
+def db_value(value):
+    value = str(value or "").strip()
+    return value or "未填写"
+
+def onsite_navigation_version_table(records):
+    """onsite 本体导航问题：版本为列，问题分类为行。"""
+    subset = [
+        r for r in records
+        if db_value(r.get("problem_module")) == "本体导航"
+    ]
+    versions = []
+    categories = []
+    for record in subset:
+        version = db_value(record.get("software_version"))
+        if version not in versions:
+            versions.append(version)
+        category = db_value(record.get("problem_category"))
+        if " / " in category:
+            category = category.split(" / ")[-1]
+        if category not in categories:
+            categories.append(category)
+    counts = Counter()
+    for record in subset:
+        version = db_value(record.get("software_version"))
+        category = db_value(record.get("problem_category"))
+        if " / " in category:
+            category = category.split(" / ")[-1]
+        counts[(category, version)] += 1
+    rows = []
+    for category in categories:
+        values = [counts[(category, version)] for version in versions]
+        rows.append((category, *values, sum(values)))
+    rows.append(("合计", *(sum(counts[(category, version)] for category in categories) for version in versions), len(subset)))
+    return markdown_table(["问题分类\\软件版本", *versions, "合计"], rows)
+
+def generate_table_report(records, source_label, person, quarter):
+    """只生成统计表；原因分布直接按查询返回的数据库字段聚合。"""
+    total = len(records)
+    typed = []
+    type_counter = Counter()
+    prompt_counter = Counter()
+    for record in records:
+        ptype = classify_problem_type(record.get("description", ""))
+        record["report_problem_type"] = ptype
+        typed.append(record)
+        type_counter[ptype] += 1
+        prompt_counter[classify_prompt_info(record.get("description", ""))] += 1
+
+    type_order = ["导航", "定位", "建图", "非本体导航", "TB单异常/资料不全"]
+    type_rows = [(f"本体导航/{name}" if name in {"导航", "定位", "建图", "非本体导航"} else name,
+                  type_counter.get(name, 0), fmtpct(type_counter.get(name, 0), total))
+                 for name in type_order]
+    type_rows.append(("合计", total, "100.00%"))
+
+    cause_sections = []
+    for ptype in type_order:
+        subset = [r for r in typed if r["report_problem_type"] == ptype]
+        if not subset:
+            continue
+        pairs = Counter((db_value(r.get("problem_category")), db_value(r.get("problem_module"))) for r in subset)
+        rows = [(category, module, count, fmtpct(count, len(subset)))
+                for (category, module), count in pairs.most_common()]
+        rows.append(("合计", "", len(subset), "100.00%"))
+        cause_sections.append(f"### {('本体导航/' if ptype != 'TB单异常/资料不全' else '')}{ptype}原因分布\n\n" +
+                             markdown_table(["数据库问题分类", "数据库问题模块", "单数", "占该类型比例"], rows))
+
+    prompt_rows = [(key, value, fmtpct(value, total)) for key, value in prompt_counter.most_common()]
+    solution_counts = Counter(db_value(r.get("solution_text")) for r in typed)
+    solution_rows = [(key, value, fmtpct(value, total)) for key, value in solution_counts.most_common()]
+    return {
+        "title": f"{quarter}问题统计表 — {person}",
+        "source_label": source_label,
+        "total": total,
+        "type_table": markdown_table(["问题类型", "单数", "占比"], type_rows),
+        "cause_table": "\n\n".join(cause_sections),
+        "prompt_table": markdown_table(["提示信息类型", "单数", "占比"], prompt_rows),
+        "handling_table": markdown_table(["解决方案", "单数", "占比"], solution_rows),
+        "stability_table": onsite_navigation_version_table(typed),
+        "stability_title": "本体导航问题版本×模块",
+        "conclusions": "",
+    }
+
 
 # ═══════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Q2 现场问题分类统计")
-    parser.add_argument("--source", choices=["db", "md"], default="db",
-                        help="数据源: db=远程服务器, md=潘铮Markdown")
-    parser.add_argument("--output", default="",
-                        help="输出文件名 (默认 Q2_onsite_review_{source}.md)")
-    args = parser.parse_args()
+CF_MAP = {
+    "659369d32ae435dd0b3c803e": "vehicle_model", "637c2e2ffbb56c003fdd74e9": "carrier_type",
+    "62c51d82d7ab965fbdebd686": "occurrence_frequency", "6645bd4d22e1f70dadb953f6": "software_version",
+    "624e4bf0972b3d03d3008c4c": "problem_description", "69241440caabefe748f91359": "investigation_conclusion",
+    "692414313ffb7e9afc4e9f43": "doc_value", "6924139133e26574155ea68b": "investigation_doc",
+    "625f75e9882430143f5bfd0a": "attachments", "691a95544ce9d3d5a5e541e1": "problem_category",
+    "691a95f304c9e52bc9058bd6": "problem_module", "62651eadef4cf6063244aa5c": "guide_doc",
+    "625f8339882430143f5c0b9a": "formal_version", "625f8317d472ef3d5c2f39a4": "root_cause",
+    "625f8329b416f5118bb099b2": "solution", "68f637359ae2d0854e946cb3": "submitter",
+}
 
-    base = Path(__file__).parent
-    output_name = args.output or f"Q2_onsite_review_{args.source}.md"
-    output = base / output_name
-    panzheng = Path("/home/zhr/zhr_ws/src/潘铮_2026Q2_现场问题子单明细.md")
+def parse_raw_json(raw):
+    if isinstance(raw, list):
+        fields = raw
+        task = {}
+    else:
+        fields = None
+        task = None
+        if isinstance(raw, dict):
+            task = raw
+        else:
+            try:
+                task = json.loads(raw)
+            except (TypeError, ValueError):
+                return {}
+        if isinstance(task, list):
+            fields = task
+        else:
+            fields = task.get("customfields") or task.get("customFields") or []
+    result, attachments = {}, []
+    for field in fields if isinstance(fields, list) else []:
+        if not isinstance(field, dict):
+            continue
+        cfid = str(field.get("cfId") or field.get("customFieldId") or field.get("customfieldId") or "")
+        col = CF_MAP.get(cfid)
+        values = field.get("value") or []
+        if not col or not isinstance(values, list):
+            continue
+        if col == "attachments":
+            attachments.extend(str(v.get("title") or "").strip() for v in values if isinstance(v, dict) and v.get("title"))
+        elif values and isinstance(values[0], dict) and values[0].get("title"):
+            result[col] = str(values[0]["title"]).strip()
+    if attachments:
+        result["attachments"] = "; ".join(attachments)
+    return result
 
-    records = None
-    source_label = ""
-
-    if args.source == "db":
+def migrate_customfields(source, dry_run=False):
+    conn = get_db_connection(source)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM onsite_problem_details WHERE raw_json IS NOT NULL AND raw_json != ''")
+    total = cursor.fetchone()[0]
+    print(f"[INFO] {source} 待处理: {total} 条")
+    cursor.execute("SELECT id, task_id, raw_json FROM onsite_problem_details WHERE raw_json IS NOT NULL AND raw_json != ''")
+    rows = cursor.fetchall()
+    cols = list(dict.fromkeys(CF_MAP.values()))
+    if dry_run:
+        for rid, tid, raw in rows[:10]:
+            print(f"  id={rid} task={str(tid)[:20]}: {parse_raw_json(raw)}")
+        cursor.close(); conn.close(); return
+    sql = f"UPDATE onsite_problem_details SET {', '.join(f'{c}=%s' for c in cols)} WHERE id=%s"
+    updated = skipped = errors = 0
+    for rid, _tid, raw in rows:
+        values = parse_raw_json(raw)
+        if not values:
+            skipped += 1; continue
         try:
-            import pymysql
-            conn = pymysql.connect(**DB_CONFIG)
-            records = fetch_from_db(conn)
-            conn.close()
-            if records:
-                source_label = f"172.19.3.79 onsite_problem DB ({len(records)} 条 Q2)"
-                print(f"[INFO] 远程 DB: {len(records)} 条 Q2 记录")
-        except Exception as e:
-            print(f"[ERROR] 远程 DB 连接失败: {e}", file=sys.stderr)
-            sys.exit(1)
+            cursor.execute(sql, [values.get(c) for c in cols] + [rid])
+            updated += 1
+        except Exception as exc:
+            errors += 1
+            if errors <= 5: print(f"[ERROR] id={rid}: {exc}", file=sys.stderr)
+        if (updated + skipped) % 2000 == 0:
+            conn.commit()
+    conn.commit(); cursor.close(); conn.close()
+    print(f"[DONE] 总={total}, 更新={updated}, 跳过={skipped}, 错误={errors}")
 
-    if args.source == "md" or not records:
-        if not panzheng.exists():
-            print("ERROR: no data source available", file=sys.stderr)
-            sys.exit(1)
-        records = parse_panzheng_markdown(str(panzheng))
-        source_label = f"潘铮 Q2 Markdown ({len(records)} 条)"
-        print(f"[INFO] Markdown: {len(records)} 条")
+def render_template(report, template_path, variables):
+    if not template_path:
+        return report
+    template = Path(template_path).read_text(encoding="utf-8")
+    values = {"report_body": report, **variables}
+    for key, value in values.items():
+        template = template.replace("{{" + key + "}}", str(value))
+    return template
 
+def make_parser():
+    parser = argparse.ArgumentParser(description="onsite-top 报表和数据迁移工具")
+    sub = parser.add_subparsers(dest="command", required=True)
+    report = sub.add_parser("report", help="分类并生成 Markdown 报告")
+    report.add_argument("--person", default="潘峥", help="人员名称或 executor_id（默认：潘峥）")
+    report.add_argument("--quarter", default="Q2", type=str.upper, choices=QUARTERS, help="季度（默认：Q2）")
+    report.add_argument("--year", default=2026, type=int)
+    report.add_argument("--source", default="onsite", choices=["benti", "onsite", "md"], help="兼容参数；数据库报告会由 --table 决定来源")
+    report.add_argument("--table", default="onsite_problem", choices=list(TABLES), help="数据库表：program_issue_details 或 onsite_problem")
+    report.add_argument("--input-file", default="", help="source=md 时的输入 Markdown")
+    report.add_argument("--output", default="", help="输出路径，默认：潘峥_Q2_<source>.md")
+    report.add_argument("--template", default="", help="模板路径，默认使用 scripts/report.template.md；支持统计表和结论占位符")
+    migrate = sub.add_parser("migrate", help="将 raw_json customField 迁移到结构化列")
+    migrate.add_argument("--source", default="onsite", choices=["benti", "onsite"])
+    migrate.add_argument("--dry-run", action="store_true", help="只预览前 10 条，不写数据库")
+    return parser
+
+def main():
+    args = make_parser().parse_args()
+    if args.command == "migrate":
+        migrate_customfields(args.source, args.dry_run); return
+    base = Path(__file__).parent
+    start, end = quarter_dates(args.year, args.quarter)
+    if args.source == "md":
+        input_file = Path(args.input_file) if args.input_file else Path("/home/zhr/zhr_ws/src/潘峥_2026Q2_现场问题子单明细.md")
+        if not input_file.exists():
+            raise SystemExit(f"ERROR: Markdown 数据文件不存在: {input_file}")
+        records = parse_panzheng_markdown(str(input_file))
+        source_label = f"{args.person} {args.quarter} Markdown ({len(records)} 条)"
+    else:
+        table_source = TABLES[args.table][0]
+        person_id = DEFAULT_EXECUTORS[table_source].get(args.person, args.person)
+        conn = get_db_connection(table_source)
+        try: records = fetch_from_db(conn, args.table, start, end, person_id)
+        finally: conn.close()
+        source_label = f"{args.table} ({table_source} DB，{len(records)} 条 {args.quarter})"
     if not records:
-        print("ERROR: empty data", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"[INFO] 分类 {len(records)} 条...")
-    stats = classify_all(records)
-    report = generate_report(stats, source_label)
+        raise SystemExit("ERROR: 数据为空")
+    tables = generate_table_report(records, source_label, args.person, args.quarter)
+    template = args.template or str(base / "report.template.md")
+    template_values = dict(tables)
+    template_values.update({"person": args.person, "quarter": args.quarter,
+                            "source": args.table if args.source != "md" else args.source,
+                            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    report = render_template("", template, template_values)
+    suffix = args.table if args.source != "md" else "md"
+    output = Path(args.output) if args.output else base / f"{args.person}_{args.quarter}_{suffix}.md"
     output.write_text(report, encoding="utf-8")
-
-    tc = stats["type_counter"]
-    print(f"[DONE] → {output}")
-    print(f"   总:{stats['total']}  导航:{tc.get('导航',0)}  定位:{tc.get('定位',0)}  建图:{tc.get('建图',0)}  非本体:{tc.get('非本体导航',0)}")
-    print(f"   导航-软件bug:{stats['nav_cause_counter'].get('软件bug',0)} 其他模块:{stats['nav_cause_counter'].get('其他模块',0)} 外部:{stats['nav_cause_counter'].get('外部因素',0)} 未知:{stats['nav_cause_counter'].get('未知原因',0)}")
+    print(f"[DONE] → {output} ({len(records)} 条)")
 
 
 if __name__ == "__main__":
