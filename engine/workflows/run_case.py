@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,42 @@ def _tb_title(payload: dict[str, Any]) -> str:
     result = payload.get("task_response", {}).get("result", [])
     if isinstance(result, list) and result and isinstance(result[0], dict):
         return str(result[0].get("content", "")).strip()
+    return ""
+
+
+def _extract_time_from_activities(payload: dict[str, Any]) -> str:
+    """从 TB activities 中提取时间描述，往后 fallback 到任务描述。"""
+    # 先用 raw 评论（已保存到 JSON 的 activities），再 fallback 到 task content
+    activities = payload.get("activities", [])
+    if not isinstance(activities, list):
+        activities = []
+    texts = []
+    for a in activities[:5]:  # 只看前5条评论
+        if isinstance(a, dict) and a.get("action") == "comment":
+            content = a.get("content", "")
+            if isinstance(content, str):
+                texts.append(content)
+    # task description
+    result = payload.get("task_response", {}).get("result", [])
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        desc = str(result[0].get("note", "") or result[0].get("description", "") or "").strip()
+        if desc:
+            texts.append(desc)
+
+    # 匹配时间模式
+    patterns = [
+        r"(\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2})",   # 2026-08-06 10:00
+        r"(\d{1,2}月\d{1,2}[日号]\s*\d{1,2}[:：点]\d{2})",     # 8月6日 10:30
+        r"(昨天|今天|前天)\s*\d{1,2}[:：点]\d{2}",              # 昨天 10:30
+        r"(昨天|今天|前天)\s*(上午|下午|晚上|中午)",               # 昨天下午
+        r"(\d+[个]?小时前|\d+[个]?分钟前)",                      # 3小时前
+        r"(上[午下][午]|\d{1,2}:\d{2})",                       # 上午
+    ]
+    for text in texts:
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                return m.group(1)
     return ""
 
 
@@ -86,6 +123,12 @@ def run_case(request: RunCaseRequest, *, external_enricher: ExternalEnricher | N
         title = _tb_title(payload)
         if title:
             context["task_title"] = title
+            # auto-extract: if user didn't provide symptom, use TB title
+            if not context["symptom"] or context["symptom"].strip() == "随便填个现象":
+                context["symptom"] = title
+        # auto-extract time from TB comments/description
+        if not context["time_window"]:
+            context["time_window"] = _extract_time_from_activities(payload)
 
     write_json(case_dir / "context.json", context)
     write_json(case_dir / "status.json", {"case_id": request.case_id, "status": "created", "created_at": context["created_at"], "updated_at": now_iso(), "next_action": "Run /diagnosis-orchestrator with next-prompt.md"})

@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from agent.nodes.run_cli import run_cli_workflow
+from agent.nodes.origin_v1 import run_origin_v1
 class CliWorkflowNodeTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_material_runs_complete_migrated_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -18,7 +18,7 @@ class CliWorkflowNodeTests(unittest.IsolatedAsyncioTestCase):
             )
             case_dir = root / "cases" / "case-cli"
 
-            result = await run_cli_workflow({
+            result = await run_origin_v1({
                     "case_id": "case-cli",
                     "case_dir": str(case_dir),
                     "input_roots": [str(uploads)],
@@ -52,7 +52,7 @@ class CliWorkflowNodeTests(unittest.IsolatedAsyncioTestCase):
             outside.write_text("private\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ValueError, "outside the tenant"):
-                await run_cli_workflow(
+                await run_origin_v1(
                     {
                         "case_id": "case-isolation",
                         "case_dir": str(root / "cases" / "case-isolation"),

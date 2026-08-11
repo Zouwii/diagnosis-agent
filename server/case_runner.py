@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 
-def _graph_app():
-    from agent.graph import app
-
-    return app
+def _graph_app(version: str = "graph-v1"):
+    """Get the compiled graph for the given version."""
+    from agent.graph import GRAPHS
+    return GRAPHS.get(version, GRAPHS["graph-v1"])
 
 
 def graph_input(case_id: str, case: dict[str, Any], request: Any) -> dict[str, Any]:
@@ -34,7 +34,7 @@ def graph_input(case_id: str, case: dict[str, Any], request: Any) -> dict[str, A
             "log_path": request.log_path,
             "knowledge_sources": request.knowledge_sources,
             "code_sources": request.code_sources,
-            "external_evidence": True,
+            "external_evidence": getattr(request, "external_evidence", True) is not False,
         },
         "findings": [],
         "error_codes": [],
@@ -63,17 +63,18 @@ async def run_diagnosis(
     case_id: str,
     case: dict[str, Any],
     request: Any,
+    version: str = "graph-v1",
     persist: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Execute LangGraph and update the mutable API Case record in place."""
     try:
-        update_status(case, "collecting", f"开始诊断: {request.symptom}")
-        add_progress(case, "graph", "LangGraph 工作流已启动", event="node_start")
+        update_status(case, "collecting", f"开始诊断 [{version}]: {request.symptom}")
+        add_progress(case, "graph", f"LangGraph 工作流已启动 (version={version})", event="node_start")
         if persist:
             persist(case)
 
         config = {"configurable": {"thread_id": case_id}}
-        result = await _graph_app().ainvoke(graph_input(case_id, case, request), config)
+        result = await _graph_app(version).ainvoke(graph_input(case_id, case, request), config)
 
         case["source_type"] = result.get("source_type", case["source_type"])
         case["conclusion_status"] = result.get("conclusion_status")

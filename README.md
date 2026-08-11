@@ -5,7 +5,7 @@
 ## 架构
 
 ```
-FastAPI (server/)  →  LangGraph (agent/)  →  diagnosis_cli.py (jz-claude-skills)
+FastAPI (server/)  →  LangGraph (agent/)  →  migrated diagnosis_cli / engine
                           │
                     ┌─────┴─────┐
                     │ LiteLLM    │  LangSmith
@@ -22,12 +22,12 @@ diagnosis-agent/
 │   ├── worker.py          独立文件队列 Worker（不占端口）
 │   └── api/cases.py       Case CRUD + SSE 进度推送
 ├── agent/                 LangGraph 编排
-│   ├── graph.py           薄 StateGraph（当前直接执行完整 CLI Engine）
+│   ├── graph.py           三版本 StateGraph（origin-v1 / origin-split / graph-v1）
 │   ├── state.py           DiagnosisState TypedDict
 │   └── nodes/             各节点实现 (逐步实现)
 ├── models/
 │   └── router.py          LiteLLM 模型路由层
-├── engine/                模块化诊断引擎（全量迁移自 diagnosis-orchestrator）
+├── engine/                diagnosis-orchestrator 核心实现（含完整 diagnosis_cli 与拆分模块）
 ├── knowledge/             领域知识 (Playbook + 关联图)
 ├── data/                  开发环境运行时数据
 │   ├── tenants/{owner}/   租户隔离的 uploads/ 和 cases/
@@ -130,16 +130,34 @@ Web 请求必须明确传 `mode`。服务端使用固定白名单映射，不由
 当前后端直接调用从这些 Skills 迁移出的采集实现，并在 Case 中记录
 `selected_skill` 和 `analysis_skill`，随后统一进入诊断图。
 
-当前诊断图保持单一路径：
+### 版本职责
+
+Diagnosis Agent 保留三条并行版本，不能把它们混为一个实现：
+
+| version | LangGraph 职责 | 流程语义 |
+|---|---|---|
+| `origin-v1` | 一个完整流程节点 | 一次性调用迁移后的 `diagnosis_cli`，完整复刻原始 orchestrator |
+| `origin-split` | 多个流程节点 | 调用拆分后的 `diagnosis_cli` 模块，完成与 origin-v1 等价的完整流程 |
+| `graph-v1` | 后续演进版本 | 在不破坏前两个版本的前提下演进新的图编排 |
+
+`origin-v1` 是兼容基线：必须保留 `diagnosis_cli` 的完整流程语义，不能改成单独的
+LLM prompt、单独的 `doc_agent` 调用或跳过分析步骤。
+
+`origin-split` 只是把同一套诊断流程拆成采集、分析、报告等节点；拆分后的节点合起来
+必须覆盖原始 orchestrator 的完整行为。
+
+当前版本路由如下：
 
 ```text
-START → run_cli_workflow → END
+origin-v1:    START → diagnosis_cli → END
+origin-split: START → collect → analyze → report → END
+graph-v1:     后续演进版本
 ```
 
-`run_cli_workflow` 直接复用从 `diagnosis-orchestrator` 拆分迁移的完整模块化
-CLI Engine：采集、确定性日志分析、时间窗处理、外部证据补充和报告渲染。
-后续只在它之后增加 `analysis_agent` 和 `fusion_agent`，不会恢复来源识别、
-双 Agent 仲裁或多路 fan-out。
+`diagnosis-agent` 已迁移 `jz-claude-skills` 中 `diagnosis-orchestrator` 的核心
+Python 实现。`origin-v1` 使用迁移后的 `diagnosis_cli` 完整入口；`origin-split`
+使用同一入口拆分后的 `engine` 模块。两者都必须完成采集、确定性分析、时间窗处理、
+外部证据补充和报告渲染。
 
 身份有两种可信来源：
 
@@ -178,12 +196,11 @@ CLI Engine：采集、确定性日志分析、时间窗处理、外部证据补�
 
 | 编号 | 文档 | 说明 |
 |---|---|---|
-| 01 | [架构说明](docs/01-架构说明.md) | FastAPI + Worker + LangGraph 单节点 + 模块化 engine |
+| 01 | [架构说明](docs/01-架构说明.md) | FastAPI + Worker + 三版本 LangGraph + diagnosis_cli |
 | 02 | [开发任务](docs/02-开发任务.md) | 稳定任务编号，Now / Later 分列 |
 | 03 | [source-docs 索引](docs/03-source-docs索引.md) | 知识源资产及生成方式 |
 | 05 | [开发指南](docs/05-开发指南.md) | 本地运行、测试、开发手册 |
 | 06 | [高频导航问题知识建设任务](docs/06-高频导航问题知识建设任务.md) | 知识建设专项任务 |
-| — | [历史归档](docs/archive/) | 已过时的历史设计方案 |
 
 - PRD: [../pm-learning/jz-product/05-技术支持诊断Agent-PRD.md](../pm-learning/jz-product/05-技术支持诊断Agent-PRD.md)
 - 系统架构: [../pm-learning/jz-product/07-技术支持诊断Agent-系统架构设计.md](../pm-learning/jz-product/07-技术支持诊断Agent-系统架构设计.md)

@@ -73,8 +73,8 @@ async def run_pending_once(storage: TenantStorage | None = None) -> int:
             def persist(record: dict[str, Any]) -> None:
                 storage.write_case_record(owner_safe, case_id, record)
 
-            print(f"[diagnosis-worker] start case={case_id} mode={current.get('mode')}", flush=True)
-            await run_diagnosis(case_id, current, _request_from_case(current), persist=persist)
+            print(f"[diagnosis-worker] start case={case_id} mode={current.get('mode')} version={current.get('version','graph-v1')}", flush=True)
+            await run_diagnosis(case_id, current, _request_from_case(current), version=str(current.get("version") or "graph-v1"), persist=persist)
             print(f"[diagnosis-worker] finish case={case_id} status={current.get('status')}", flush=True)
             completed += 1
         finally:

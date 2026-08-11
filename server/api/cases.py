@@ -31,6 +31,7 @@ _cases: dict[str, dict] = {}
 
 class CreateCaseRequest(BaseModel):
     mode: Literal["internal_robot", "tb_task", "remote_site", "local_logs"]
+    version: Literal["origin-v1", "origin-split", "graph-v1"] = "graph-v1"
     # 按来源二选一
     robot_ip: str | None = Field(None, description="内网机器人 IP，如 172.22.0.222")
     task_url: str | None = Field(None, description="TB 任务链接")
@@ -39,7 +40,7 @@ class CreateCaseRequest(BaseModel):
     log_path: str | None = Field(None, description="当前租户工作区或 uploads 目录内的服务器路径")
     upload_id: str | None = Field(None, description="由日志上传接口返回的 ID")
     # 通用
-    symptom: str = Field(..., description="问题现象，如 '到点后旋转3圈停止'")
+    symptom: str | None = Field(None, description="问题现象，tb_task 可省略（自动从 TB 标题提取）")
     time_window: str | None = Field(None, description="问题时间，如 '2026-07-27 20:00'")
     knowledge_sources: list[str] = Field(default_factory=list)
     code_sources: list[str] = Field(default_factory=list)
@@ -47,6 +48,7 @@ class CreateCaseRequest(BaseModel):
 
 class CaseResponse(BaseModel):
     case_id: str
+    version: str | None = None
     status: Literal["pending", "collecting", "analyzing", "awaiting_human", "closed", "failed"]
     source_type: str
     mode: str
@@ -161,6 +163,7 @@ async def create_case(
         "input_root": str(uploads_root),
         "input_roots": [str(root) for root in input_roots],
         "status": "pending",
+        "version": req.version,
         "source_type": req.mode,
         "mode": req.mode,
         "selected_skill": mode_spec.collection_skill,

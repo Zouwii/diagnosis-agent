@@ -7,7 +7,9 @@
 
 ## 1. 决策与目标
 
-Diagnosis-Agent 当前的可靠基线是一次性运行的确定性诊断引擎：采集一种来源的材料，进行规则分析和外部证据补充，输出报告。它适合 Demo 和首批真实 Case，但不能自然表达“根据已获得的证据选择、并行比较或停止不同排查路线”。
+`origin-v1` 是 Diagnosis-Agent 的兼容基线：一次性调用完整 `diagnosis_cli`，复刻原始
+orchestrator。`origin-split` 将同一流程拆成可测试节点。本文只描述 `graph-v1` 后续
+如何在不改变前两个版本语义的前提下，引入证据路线、并行比较和人工接管。
 
 后续不替换 Engine，也不让多个 LLM 自由协作。目标是把 Engine 作为受控工具集合，由 LangGraph 作为 Case 状态机，并以 Harness 统一约束路线、证据、预算、恢复和人工交接。
 
@@ -38,13 +40,14 @@ Engine Tools
 
 ## 3. 分期图结构
 
-### Phase A：Demo 基线（保持现状）
+### Phase A：graph-v1 演进基线
 
 ```text
-START → run_demo_case → END
+START → run_graph_v1_case → END
 ```
 
-`run_demo_case` 调用当前完整 Engine 函数。其作用是保留一个可回归、可快速验证真实 Case 的基线；不因后续架构拆分而中断 Demo。
+`graph-v1` 的演进不改变 `origin-v1` 和 `origin-split`；两个兼容版本继续分别保留
+完整入口和拆分入口的回归验证。
 
 ### Phase B：错误码路线
 

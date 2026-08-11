@@ -5,116 +5,95 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${PROJECT_DIR}"
 
 if [[ -f .env ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env
-  set +a
+  set -a; source .env; set +a
 fi
 
 PORT="${PORT:-6001}"
 HOST="${HOST:-0.0.0.0}"
-DIAGNOSIS_RUNTIME_DIR="${DIAGNOSIS_RUNTIME_DIR:-${PROJECT_DIR}/runtime}"
-DIAGNOSIS_STORAGE_ROOT="${DIAGNOSIS_STORAGE_ROOT:-${DIAGNOSIS_RUNTIME_DIR}/storage}"
-API_PID_FILE="${DIAGNOSIS_RUNTIME_DIR}/diagnosis-api.pid"
-WORKER_PID_FILE="${DIAGNOSIS_RUNTIME_DIR}/diagnosis-worker.pid"
-API_LOG_FILE="${DIAGNOSIS_RUNTIME_DIR}/diagnosis-api.log"
-WORKER_LOG_FILE="${DIAGNOSIS_RUNTIME_DIR}/diagnosis-worker.log"
-PYTHON_BIN="${PROJECT_DIR}/.venv/bin/python"
+RUNTIME_DIR="${RUNTIME_DIR:-${PROJECT_DIR}/runtime}"
+STORAGE_ROOT="${DIAGNOSIS_STORAGE_ROOT:-${RUNTIME_DIR}/storage}"
+API_PID_FILE="${RUNTIME_DIR}/diagnosis-api.pid"
+WORKER_PID_FILE="${RUNTIME_DIR}/diagnosis-worker.pid"
+API_LOG="${RUNTIME_DIR}/diagnosis-api.log"
+WORKER_LOG="${RUNTIME_DIR}/diagnosis-worker.log"
 
-export PORT DIAGNOSIS_STORAGE_ROOT
-mkdir -p "${DIAGNOSIS_RUNTIME_DIR}" "${DIAGNOSIS_STORAGE_ROOT}"
+export PORT DIAGNOSIS_STORAGE_ROOT="${STORAGE_ROOT}"
+mkdir -p "${RUNTIME_DIR}" "${STORAGE_ROOT}"
 
 if (( PORT < 6001 )); then
-  echo "[diagnosis] ERROR: Agent services must use port 6001 or above (got ${PORT})"
+  echo "[diagnosis] ERROR: port must be >= 6001, got ${PORT}"
   exit 1
 fi
 
+# 优先 .venv，其次 poetry，最后 system python
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON_BIN=".venv/bin/python"
+elif command -v poetry >/dev/null 2>&1; then
+  PYTHON_BIN="poetry run python"
+else
+  PYTHON_BIN="python3"
+fi
+
 is_running() {
-  local pid_file="$1"
-  [[ -f "${pid_file}" ]] || return 1
-  local pid
-  pid="$(cat "${pid_file}")"
+  [[ -f "$1" ]] || return 1
+  local pid; pid="$(cat "$1")"
   [[ -n "${pid}" ]] && kill -0 "${pid}" >/dev/null 2>&1
 }
 
-install_deps() {
-  if [[ ! -x "${PYTHON_BIN}" ]]; then
-    python3 -m venv .venv
-  fi
-  "${PYTHON_BIN}" -m pip install --upgrade pip
-  "${PYTHON_BIN}" -m pip install -r requirements.txt
-}
-
 start_services() {
-  if [[ ! -x "${PYTHON_BIN}" ]]; then
-    echo "[diagnosis] virtualenv missing; run: bash run_on_pc_daemon.sh install"
-    exit 1
-  fi
   if is_running "${API_PID_FILE}" || is_running "${WORKER_PID_FILE}"; then
-    echo "[diagnosis] service already running; use restart"
+    echo "[diagnosis] already running, use restart"
     exit 1
   fi
 
-  nohup "${PYTHON_BIN}" -m uvicorn server.main:app --host "${HOST}" --port "${PORT}" >>"${API_LOG_FILE}" 2>&1 &
-  echo $! >"${API_PID_FILE}"
-  nohup "${PYTHON_BIN}" -m server.worker >>"${WORKER_LOG_FILE}" 2>&1 &
-  echo $! >"${WORKER_PID_FILE}"
-  sleep 1
+  nohup ${PYTHON_BIN} -m uvicorn server.main:app --host "${HOST}" --port "${PORT}" >> "${API_LOG}" 2>&1 &
+  echo $! > "${API_PID_FILE}"
+  nohup ${PYTHON_BIN} -m server.worker >> "${WORKER_LOG}" 2>&1 &
+  echo $! > "${WORKER_PID_FILE}"
+  sleep 2
 
-  if ! is_running "${API_PID_FILE}" || ! is_running "${WORKER_PID_FILE}"; then
-    echo "[diagnosis] ERROR: startup failed"
-    tail -n 50 "${API_LOG_FILE}" "${WORKER_LOG_FILE}" || true
+  if ! is_running "${API_PID_FILE}"; then
+    echo "[diagnosis] ERROR: API startup failed"
+    tail -20 "${API_LOG}" || true
     exit 1
   fi
-  echo "[diagnosis] API started: http://${HOST}:${PORT}"
-  echo "[diagnosis] Worker started (no listening port)"
-}
 
-stop_one() {
-  local name="$1"
-  local pid_file="$2"
-  if ! is_running "${pid_file}"; then
-    rm -f "${pid_file}"
-    return
-  fi
-  local pid
-  pid="$(cat "${pid_file}")"
-  echo "[diagnosis] stopping ${name} pid=${pid}"
-  kill "${pid}" >/dev/null 2>&1 || true
-  for _ in $(seq 1 15); do
-    kill -0 "${pid}" >/dev/null 2>&1 || break
-    sleep 1
-  done
-  if kill -0 "${pid}" >/dev/null 2>&1; then
-    kill -9 "${pid}" >/dev/null 2>&1 || true
-  fi
-  rm -f "${pid_file}"
+  echo "[diagnosis] API:  http://${HOST}:${PORT}"
+  echo "[diagnosis] Worker started (no port)"
 }
 
 stop_services() {
-  stop_one "worker" "${WORKER_PID_FILE}"
-  stop_one "api" "${API_PID_FILE}"
+  for name_file in "worker:${WORKER_PID_FILE}" "api:${API_PID_FILE}"; do
+    local name="${name_file%%:*}" pid_file="${name_file##*:}"
+    if ! is_running "${pid_file}"; then rm -f "${pid_file}"; continue; fi
+    local pid; pid="$(cat "${pid_file}")"
+    echo "[diagnosis] stopping ${name} (pid=${pid})"
+    kill "${pid}" 2>/dev/null || true
+    for _ in $(seq 1 10); do kill -0 "${pid}" 2>/dev/null || break; sleep 1; done
+    kill -9 "${pid}" 2>/dev/null || true
+    rm -f "${pid_file}"
+  done
+  echo "[diagnosis] stopped"
 }
 
 show_status() {
   if is_running "${API_PID_FILE}"; then
-    echo "[diagnosis] API running pid=$(cat "${API_PID_FILE}") port=${PORT}"
+    echo "[diagnosis] API running  pid=$(cat "${API_PID_FILE}")  port=${PORT}"
   else
     echo "[diagnosis] API stopped"
   fi
   if is_running "${WORKER_PID_FILE}"; then
-    echo "[diagnosis] Worker running pid=$(cat "${WORKER_PID_FILE}")"
+    echo "[diagnosis] Worker running  pid=$(cat "${WORKER_PID_FILE}")"
   else
     echo "[diagnosis] Worker stopped"
   fi
 }
 
 case "${1:-start}" in
-  install) install_deps ;;
-  start) start_services ;;
-  stop) stop_services ;;
+  start)   start_services ;;
+  stop)    stop_services ;;
   restart) stop_services; start_services ;;
-  status) show_status ;;
-  logs) tail -n 100 -f "${API_LOG_FILE}" "${WORKER_LOG_FILE}" ;;
-  *) echo "Usage: bash run_on_pc_daemon.sh {install|start|stop|restart|status|logs}"; exit 1 ;;
+  status)  show_status ;;
+  logs)    tail -n 100 -f "${API_LOG}" "${WORKER_LOG}" ;;
+  *) echo "Usage: bash run_on_pc_daemon.sh {start|stop|restart|status|logs}"; exit 1 ;;
 esac

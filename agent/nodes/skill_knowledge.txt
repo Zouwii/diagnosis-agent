@@ -1,0 +1,1166 @@
+## Skill: diagnosis-orchestrator
+
+# 技术支持诊断编排入口
+
+本 skill 是技术支持问题诊断的短期统一入口。它不重复实现专项诊断知识，只负责识别输入来源、建立 case 上下文、调用现有 skills、统一产出格式。
+
+## 使用边界
+
+- 默认只读诊断，不执行机器人写操作、重启服务、修改配置或发版。
+- 不绕过 Teambition、钉钉、GitLab 的当前用户权限。
+- 不上传日志、钉钉知识库文档、Teambition 任务内容到第三方系统。
+- `dingtalk-writer` 仅在用户确认后用于发布或更新钉钉知识库文档。
+
+## 快速流程
+
+1. 识别输入来源：TB 任务、远程现场、公司内网机器人、本地日志包或信息不足。
+2. 建立 case 上下文，至少记录 `case_id`、`source_type`、`symptom`、`time_window`、`knowledge_sources`、`code_sources`。
+3. 调用数据采集 skill：
+   - 公司内网机器人：`robot-peek`
+   - 客户现场远程：`remote-hand`
+   - Teambition 任务：`teambition`
+   - 本地日志包：直接交给 `robot-diagnosis` 离线分析
+4. 调用 `robot-diagnosis` 做基础诊断和时间线分析。
+5. 根据证据分流到专项 skill：
+   - 任务链路：`task-engine-troubleshoot`
+   - 传感器/激光/相机：`device-log-analyzer`
+   - 机型配置：`robot-model-config`
+6. 需要已有经验、SOP、错误码解释或排查指南时，调用 `dingtalk-docs`，最多读取 5 篇正文。
+7. 需要代码、MR、Issue、提交或流水线证据时，调用 `gitlab-operator`。
+8. 输出诊断报告；如果不能闭环，同时输出人工介入清单。
+9. 钉钉知识库没有覆盖或已有文档不完整时，输出钉钉知识库沉淀草稿。
+
+## 输入识别
+
+按优先级判断：
+
+| 输入特征 | 来源类型 | 首选数据源 |
+|---|---|---|
+| 包含 TB 链接或 taskId | `tb_task` | `teambition` |
+| 包含 frp 端口、远程之手、客户现场实时排查 | `remote_site` | `remote-hand` |
+| 包含 172.x IP | `internal_robot` | `robot-peek` |
+| 包含本地日志包路径 | `local_logs` | `robot-diagnosis` |
+| 只有现象描述 | `insufficient_data` | 追问最小信息 |
+
+如果信息不足，只问一个阻塞问题，例如：“这是公司内网机器人、TB 任务、远程现场，还是本地日志包？”
+
+## Case 上下文
+
+每次诊断都维护以下上下文：
+
+```yaml
+case_id:
+source_type: internal_robot | tb_task | remote_site | local_logs
+symptom:
+time_window:
+robot_identity:
+artifacts:
+knowledge_sources:
+code_sources:
+analysis_route:
+conclusion_status: confirmed | likely | need_human | insufficient_data
+```
+
+## 结论可信度
+
+| 状态 | 使用条件 |
+|---|---|
+| `confirmed` | 日志、状态、代码或钉钉知识库证据闭环，能解释现象 |
+| `likely` | 证据强相关，但缺少最终验证 |
+| `need_human` | 需要现场操作、复现、硬件检查或补充权限 |
+| `insufficient_data` | 缺少关键日志、时间点、任务信息或访问条件 |
+
+## 输出模板
+
+使用本 skill 的模板文件：
+
+- 诊断报告：`templates/diagnosis-report.md`
+- 人工介入清单：`templates/human-handoff.md`
+- 钉钉知识库沉淀草稿：`templates/knowledge-draft.md`
+
+详细路由规则见 `references/routing-rules.md`。
+
+## 命令行入口
+
+中期命令行入口已提供：
+
+```bash
+./scripts/diagnosis
+```
+
+无参数运行时会读取当前目录下的 `diagnosis.config.json`。如果文件不存在，脚本会自动生成模板；编辑后再次运行即可创建 case。
+
+`./scripts/diagnosis` 会按来源先分桶，再在来源目录下创建 case：
+
+- `tb_task` → `diagnosis-cases/teambition/<case_id>/`
+- `internal_robot` → `diagnosis-cases/robot-peek/<case_id>/`
+- `remote_site` → `diagnosis-cases/remote-hand/<case_id>/`
+- `local_logs` → `diagnosis-cases/local/<case_id>/`
+
+每个 case 目录内部再放 `raw/`、`extracted/`、`tmp/`、`report.md` 等内容。其中 `tb_task` 会自动拉取任务详情、评论和附件，并同步到当前 case 的 `raw/` 与 `extracted/`；附件默认会先按 5GB 阈值自动筛选，超过阈值的文件会被记录为待确认项；**默认跳过对诊断无价值的二进制文件（.bag / .mp4 / .png 等），加 `--allow-all-attachments` 可强制下载全部附件**。`local_logs` 会把你给的本地日志路径直接导入到当前 case 的 `raw/`。需要强制下载大文件时可加 `--allow-large-downloads`。
+
+创建或 resume 后，CLI 会默认执行一轮材料采集、本地分析和只读外部证据补充：`internal_robot` 会通过 `sshpass + ssh` 对目标机器人执行只读巡检命令，把版本、状态、错误、ROS、进程和关键日志摘录保存到 `raw/robot/`；`remote_site` 会通过远程之手 frp 端口连接 Windows 工具包，再用 `ssh-robot.py` 对现场机器人执行同一套只读巡检命令，并保存到 `raw/remote-hand/`；然后扫描 `raw/` 和 `extracted/` 下的可读文本日志、JSON、YAML、Markdown，提取错误码、ERROR/WARN/异常关键词，推断后续专项 skill 路由，并把任务链路、设备日志、机型配置三类专项命中证据写入报告
+
+---
+## Skill: robot-diagnosis
+
+# 机器人系统诊断
+
+迦智机器人本体系统的系统性分析与问题排查入口。支持**在线分析**（实时诊断当前状态）和**离线分析**（从日志反推历史问题）两种模式。
+
+**核心设计：症状路由优先。** 大部分问题不需要走完整巡检流程——根据症状直接跳到对应的深度排查路径即可。系统巡检（操作系统→迦智状态→异常分析）仅在"车有问题但不清楚具体是什么"时作为兜底。
+
+---
+
+## 诊断技能全景与协作
+
+诊断相关技能分两层：**传输层**负责"怎么连上去"，**分析层**负责"诊断什么"。
+
+```
+分析层（"诊断什么"）
+  ├─ robot-diagnosis          ← 本技能：系统总入口，症状路由 + 兜底巡检
+  ├─ task-engine-troubleshoot ← 专项：任务链路（web-service / async-service / 行为树）
+  ├─ device-log-analyzer      ← 专项：传感器日志（jrosth / jzhw / 激光雷达 / 相机）
+  ├─ scan-filter-diagnosis    ← 专项：感知（scan_filter 配置/滤波/数据质量/盲区）
+  └─ robot-model-config       ← 专项：机型配置（设置/检查）+ 机型类问题反向诊断
+  └─ embedded-troubleshoot    ← 专项：嵌入式硬件（电机/驱动/IO/举升/总线/停障/电源等）
+
+传输层（"怎么连上去"）
+  ├─ robot-peek    ← 内网 172.x.x.x 直连
+  └─ remote-hand   ← 客户现场 frp 隧道
+```
+
+**典型调用栈**：用户描述问题 → 按症状路由到深度排查路径 → 必要时调用传输层建立连接 → 必要时跳转到专项分析层。
+
+---
+
+## 技术支持诊断入口交接
+
+当请求来自 `diagnosis-orchestrator`，或用户输入同时包含机器人 IP、TB 任务、远程现场端口、本地日志包、钉钉知识库范围、GitLab 仓库/MR/Issue 等上下文时，本技能作为分析层执行，不重新发明入口流程。
+
+交接规则：
+
+1. 接收并保留 case 上下文：`case_id`、`source_type`、`symptom`、`time_window`、`robot_identity`、`artifacts`、`knowledge_sources`、`code_sources`。
+2. 先建立诊断时间线，再按症状路由到专项 skill。
+3. 需要已有排查经验、错误码解释、历史 SOP 或模块设计背景时，调用 `dingtalk-docs`，最多读取 3 篇正文。
+4. 需要代码实现、历史修复、MR、Issue 或流水线证据时，调用 `gitlab-operator`。
+5. 输出必须标注结论状态：`confirmed` / `likely` / `need_human` / `insufficient_data`。
+6. 钉钉知识库没有覆盖或已有文档不完整时，生成钉钉知识库沉淀草稿，发布动作交给 `dingtalk-writer` 且必须人工确认。
+
+推荐输出使用 `diagnosis-orchestrator/templates/diagnosis-report.md` 的结构。
+
+---
+
+## 症状路由（起手必读）
+
+**优先看这里，不要上来就走巡检流程。** 匹配到症状直接跳对应路径：
+
+### 已建专项技能 — 直接路由
+
+| 用户原话 / 症状 | 起手技能 | 说明 |
+|---|---|---|
+| "任务卡住" / "任务不下发" / "行为树没执行" / "调度下不来" | `task-engine-troubleshoot` | 任务链路专属技能，不在本技能内展开 |
+| "激光雷达断连" / "相机没数据" / "jrosth/jzhw 报错" / "点云丢失" | `device-log-analyzer` | 传感器日志专属技能，不在本技能内展开 |
+| "scan_filtered 没数据" / "滤波区域不对" / "622xxx 错误码" / "盲区误检" / "激光数据 NaN" | `scan-filter-diagnosis` | 感知滤波专属技能（scan_filter 配置/数据质量），不在本技能内展开 |
+| "切机型后某功能没了" / "`/j3/` 参数缺失或为 null" / "机型校验不过" / "agent3 报必需参数缺失" | `robot-model-config` | 机型配置专属技能，不在本技能内展开 |
+| "电机不转" / "举升异常" / "停障失效" / "CAN/串口总线" / "IO板不通" / "充电问题" / "驱动器报错" / "嵌入式硬件问题" | `embedded-troubleshoot` | 嵌入式硬件知识库（电机/驱动/IO/举升/总线等），不在本技能内展开 |
+
+### 深度排查路径（本技能内）
+
+| 症状关键词 | 排查路径 | 状态 |
+|---|---|---|
+| "障碍物误检/漏检" / "安全感知误报" / "点云 costmap 异常" / "激光融合问题"（非 scan_filter 层面） | [感知检测问题排查](#感知检测问题排查) | 待建（给手动指引） |
+| "scan_filtered 没数据" / "滤波区域不对" / "622xxx 错误码" / "盲区配置" / "激光数据 NaN/Inf" | `scan-filter-diagnosis` | 直接路由 |
+| "全局搜路失败" / "局部规划异常" / "伺服对接偏差" / "速度控制异常" / "转弯抖动" | [导航和对接问题排查](#导航和对接问题排查) | 待建（给手动指引） |
+| "定位漂移" / "建图质量问题" / "二维码/反射板重定位失败" / "地图打不开" | [定位和地图问题排查](#定位和地图问题排查) | 待建（给手动指引） |
+| "调度接口不通" / "jzagent 通讯异常" / "调度服务器连接/响应异常" / "任务下发/上报失败" | [调度接口和服务器类问题排查](#调度接口和服务器类问题排查) | 待建（给手动指引） |
+
+### 兜底：系统巡检
+
+| 用户原话 | 执行路径 |
+|---|---|
+| "帮我排查" / "车有什么问题"（说不清具体症状） / "系统巡检" / "健康检查" | [系统巡检](#系统巡检兜底模式) |
+| "分析昨天的日志包"（说不清要看什么） | [离线分析](#离线分析) |
+
+### 不是本技能的场景
+
+| 用户原话 | 起手技能 |
+|---|---|
+| "找台车测试" / "看下进程在不在" / "tail 一下 log" | `robot-peek` |
+| "客户现场要远程看下" / "通过隧道连进去" | `remote-hand` |
+
+---
+
+## 安全规则
+
+
+
+---
+## Skill: robot-peek
+
+# 机器人闪测
+
+帮助开发者直连公司内网机器人，快速查验运行状态（日志、进程、ROS 话题等），或找到适合当前工程的测试车。
+
+> **注意：** 本技能用于内网直连场景。如需通过隧道访问客户现场机器人，请使用 `remote-hand` 技能。
+
+---
+
+## 安全规则（不可跳过）
+
+### 密码编码存储
+
+机器人 SSH 密码已 base64 编码存储，避免明文出现在终端日志中。使用时解码：
+
+```bash
+echo 'cm9ib3QxMjM=' | base64 -d
+# 产出: robot123
+```
+
+在 Bash 命令中，用 `"$(echo 'cm9ib3QxMjM=' | base64 -d)"` 代替明文密码。
+
+### 网段管控
+
+| 网段 | 策略 | 说明 |
+|------|------|------|
+| `172.19.*` | 最优先 | 开发/测试机器人 |
+| `172.22.*` | 优先 | 开发/测试机器人 |
+| `172.18.*` | 优先 | 开发/测试机器人 |
+| `172.23.*` | **列出但标注生产** | 生产机器人，正常展示但必须标注⚠️**生产环境**警告 |
+| 其他网段 | 允许但低优先级 | 需明确告知用户 |
+
+> **⚠️ 172.23 网段为生产环境，操作不当可能影响线上业务。连接前必须再次向用户确认。只读原则仍然适用。**
+
+`172.23.*` 的机器人正常出现在列表中，但展示时必须附加醒目的生产环境警告标识。连接前需二次确认用户意图。
+
+### 只读原则
+
+**默认只允许只读操作。** 以下是命令分类：
+
+#### 允许的只读命令（直接执行，无需确认）
+
+```
+# 日志查看
+cat, less, tail, head, zcat, zless
+journalctl (不带 --rotate/--vacuum)
+# 进程/系统状态
+ps, top, htop, free, df, du, uptime, uname, lsb_release
+systemctl status, systemctl is-active, systemctl is-enabled, systemctl list-units
+# 网络状态
+ip addr, ip route, ifconfig, ping, netstat, ss, curl (GET only), wget -O -
+# 文件查看
+ls, find, file, stat, wc, md5sum, sha256sum, readlink
+tree, which, whereis, locate
+# ROS 相关（只读）
+rostopic list, rostopic echo, rostopic info, rostopic hz
+rosnode list, rosnode info, rosnode ping
+rosservice list, rosservice info
+rosparam list, rosparam get
+rosbag info
+roslaunch --files
+rospack list, rospack find
+rosversion
+# 包管理（查询）
+dpkg -l, dpkg -s, dpkg -L, dpkg --get-selections
+apt list, apt-cache show, apt-cache policy, apt-cache search
+# 环境/配置查看
+env, printenv, echo $VAR, cat /etc/*, hostname
+docker ps, docker logs, docker inspect, docker images
+# 迦智自有指令（全部只读）
+jz_total_display, jz_install_history, jz-wifi-version
+emma_status, emma_list, emma_history, emma_checksum
+emma_errors, emma_node_state, emma_wtf
+iosys list, jnode, jlinks, jjobs list
+ls_device_interface, ls_jz_image_tag
+jz_rostopic
+# CTU/穿梭车自有指令（全部只读）
+shuttle_status, jz_shuttle_display, jz_help, jz_pgrep
+jz_shuttle_install_history, jz_shuttle_install_list, jz_ls_image_version
+jz_wifi_info
+# 进程管理（circus，只读）
+circusctl status, circusctl list, circusctl stats
+systemctl status circusd, systemctl is-active circusd
+# 崩溃文件查看
+apport-cli (只读查看崩溃报告)
+```
+
+#### 禁止的写操作（绝对不执行）
+
+```
+# 文件修改
+rm, mv, cp, chmod, chown, mkdir, rmdir, touch
+vi, vim, nano, sed -i, tee, echo >>, echo >
+truncate, shred, install
+# 包管理（修改）
+apt install, apt remove, apt upgrade, apt purge, dpkg -i, dpkg -r
+pip install, pip uninstall
+# 系统修改
+systemctl start, systemctl stop, systemctl restart, systemctl enable, systemctl disable
+systemctl daemon-reload, systemctl mask
+reboot, shutdown, init, poweroff
+mount, umount, mkfs, fdisk
+useradd, userdel, usermod, passwd, groupadd
+iptables, ufw
+crontab -e, crontab -r
+# ROS 修改
+rosservice call
+rosparam set, rosparam delete
+rosnode kill
+rosbag record, rosbag play
+roslaunch, rosrun
+catkin_make, catkin build
+# Docker 修改
+docker run, docker exec, docker stop, docker start, docker rm, docker rmi
+docker-compose up, docker-compose down
+# 危险操作
+kill, killall, pkill
+dd, scp (上传
+
+---
+## Skill: remote-hand
+
+# 迦智远程之手
+
+通过公网服务器 frp 反向隧道 + Windows 中转笔记本，远程接入客户现场——诊断局域网内的机器人、分析已采集的日志和资料、或执行远程工作。
+
+---
+
+## 安全规则（不可跳过）
+
+### 继承 robot-peek 规则
+
+连接到机器人后，**完全遵守 robot-peek 技能的安全规则**：
+- 只读原则：命令白名单/黑名单
+- 172.23.* 生产网段默认禁止访问
+- 写操作拦截机制
+
+### 额外安全规则
+
+| 规则 | 说明 |
+|------|------|
+| Windows 端只写 workspace | 仅 workspace/ 目录内允许写操作，其他位置只读 |
+| 文件传输 | 允许通过透传模式的 scp/sftp 双向传文件（见「文件传输与 SOCKS5 代理」）；小文件（≤ 2MB）仍可用 base64 经 SSH stdout 直接查看 |
+| 连接信息不留存 | 不将服务器 IP、端口、凭证写入日志或缓存 |
+| 会话结束提醒 | 诊断完成后提醒现场人员关闭 start.bat |
+
+### 连接密码（版本兼容）
+
+工具包有两套密码机制：
+
+| toolkit 版本 | 密码 | 说明 |
+|---|---|---|
+| **v1 / v2 / v3** | `robot123` | 固定默认密码 |
+| **v4+** | 随机生成 | 8 位（大小写字母 + 数字），启动时在控制台显示 |
+
+**AI 连接策略：先试旧密码，失败再索要：**
+
+```bash
+# 先尝试 v1-v3 默认密码
+export TUNNEL_PASS="$(echo 'cm9ib3QxMjM=' | base64 -d)"
+```
+
+连接验证（见 Step 1）。若认证失败（`Permission denied`），说明现场是 v4+ toolkit，向用户索取控制台显示的随机密码后更新：
+
+```bash
+export TUNNEL_PASS='<现场人员提供的8位随机密码>'
+```
+
+后续所有 `sshpass` 命令统一使用 `"$TUNNEL_PASS"` 引用密码。透传模式（ProxyCommand）中，`$TUNNEL_PASS` 需已 `export`，因为 ProxyCommand 由 ssh 在子 shell 中执行，需要从环境变量继承。
+
+---
+
+## 网络拓扑
+
+```
+AI (Claude Code)
+    │
+    │ SSH (公网服务器:映射端口, user=jz, password=随机)
+    ▼
+公网服务器 (frps)
+    │
+    │ frp 反向隧道 → 端口 2222
+    ▼
+Windows 笔记本 (Python SSH 服务器 + frpc)
+    │
+    │ paramiko SSH (局域网 robot IP:22)
+    ▼
+机器人 (jz@192.168.x.x)
+```
+
+Windows 端运行内置的 Python SSH 服务器（sshd.py），不依赖 Windows OpenSSH。SSH 服务器：
+- 用户名：`jz`，密码：v1-v3 为固定 `robot123`，v4+ 为每次启动随机生成，见「连接密码」
+- 工作目录（CWD）为 `workspace/`
+- PATH 包含 core/python/、core/tools/、core/
+- 环境变量 `TOOLKIT_DIR` 指向工具包根目录，`CORE_DIR` 指向 core/ 子目录
+
+---
+
+## 前置条件
+
+1. **公网服务器**：frps 已运行
+2. **客户现场 Windows 笔记本**：已解压工具包并运行 `start.bat`
+3. **用户已提供**：frp 映射端口号
+
+> ⚠️ **同一台 Windows 上只能开一个 toolkit（v2 和 v3 不能并存）。** toolkit 硬编码 `LISTEN_PORT=2222`（sshd.py）和 frp `admin_port=7400`，两套工具包目录里这两个值完全相同。同时开两个 `start.bat` 会出现：第二个 frpc 报 `admin server error: listen tcp 127.0.0.1:7400: bind ... only one usage ... permitted`（7400 被占），两个 sshd.py 抢 2222——**先启动的旧进程继续服务 2222，后开的根本没接管**。结果：frp 给了新端口、窗口也打印新 VERSION，但隧道背后挂的还是**旧 sshd.py**，VERSION / 透传能力仍停在旧版本。升级 toolkit 时务必先**关掉旧的**（任务管理器结束所有 toolkit 目录下的 `python.exe` 和 `frpc.exe`，或直接关掉旧 `start.bat` 窗口）再开新的。
+
+---
+
+## 工具包说明
+
+工具包由 `toolkit/setup.bat` 一键构建，生成 `jz-remote-toolkit.zip`，发送给现场人员解压即用。
+
+### 目录结构（解压后）
+
+```
+<任意目录>/
+├── start.bat                   # 一键启动（SSH 服务器 + frp 隧道）
+├── 使用说明.txt                 # 现场操作说明
+├── core/                       # 核心组件
+│   ├── frpc.pkg                # frp 客户端（内层压缩包，运行时自动解压）
+│   ├── frpc.ini                # frp 配置
+│   ├── sshd.py                 # Python SSH 服务器
+│   ├── ssh-robot.py            # SSH 机器人封装脚本
+│   ├── python/                 # Python 便携版 + 依赖包
+│   └── tools/
+│       └── ffmpeg.exe          # 视频分析工具
+└── workspace/                  # 工作目录（AI 的 home）
+```
+
+### workspace 工作目录
+
+AI SSH 连入后的 CWD 为 `workspace/`，也是唯一允许写操作的目录。
+
+| 场景 | workspace 用途 |
+|------|---------------|
+| 实时远程诊断 | 存放诊断过程中的中间数据 |
+| 离线日志分析 | 现场人员将待分析资料（日志、视频、照片、文档等）放入此目录 |
+
+**临时文件统一放 `tmp/` 子目录（不可污染 workspace 根）：**
+
+AI 在分析过程中产生的任何中间产物 —— ffmpeg 抽取的关键帧、markitdown 转换的 `.md`、Pytho
+
+---
+## Skill: teambition
+
+# Teambition 任务查阅与管理
+
+帮助开发者通过 Claude Code 查阅和管理 Teambition 项目、任务、任务详情、评论和附件。支持读取和写入操作。使用 Teambition Open API（经钉钉代理转发）作为主要数据源，钉钉项目 API 作为补充。
+
+---
+
+## 安全规则（不可跳过）
+
+### 操作权限
+
+**允许：**
+- 读取项目、任务、评论、附件信息
+- 更新任务字段（标题、描述、执行人、截止日期、优先级、状态、自定义字段）
+- 发布评论（自动添加 `🤖 [AI评论]` 前缀）
+
+**禁止：**
+- 删除任务、删除评论、删除附件
+- 任何不可逆的删除操作
+
+### 评论标识
+
+所有通过 AI 发布的评论，内容开头必须添加 `🤖 [AI评论]` 前缀，以标识来源。
+
+### 主动操作限制（不可跳过）
+
+**以下操作必须有用户明确要求才能执行，严禁 AI 主动发起：**
+
+- ❌ **禁止主动修改任务状态**（isDone、stageId）—— 用户没说"关闭任务"/"标记完成"/"改状态"，就不能动
+- ❌ **禁止主动发布评论** —— 用户没说"加条评论"/"回复一下"/"帮我评论"，就不能发
+- ❌ **禁止主动修改任何任务字段** —— 包括标题、描述、执行人、截止日期、优先级、自定义字段等
+
+即使分析完成后认为"应该同步到评论区"，也不能主动发布。只能在用户明确说"把分析结果发到单子上"之类的话时才执行。
+
+**唯一例外**：用户问题中已隐含写入意图时可视作明确要求。例如：
+- "帮我分析下这个问题" → 只读，不评论、不改状态
+- "帮我分析下这个问题，结果发到评论区" → 可以评论
+- "分析完帮我关闭这个单子" → 可以改状态
+
+### 身份（写操作）
+
+写操作（评论、更新任务）的 `X-Operator-Id` 由**代理按当前认证身份注入**（proxyToken/robot → unionId → Teambition userId）。技能**不得也不需要**在请求中传 `X-Operator-Id`——代理会忽略并覆盖任何传入值。
+
+### 凭据安全
+
+- 技能**不持有任何密钥**（AppId/SecretKey），所有 Teambition 请求经钉钉代理，凭证由代理服务端托管。
+- 不将 token、任务或项目内容输出到终端、日志或任何第三方服务。
+
+### 附件下载原则
+
+- 附件只下载到本地 `~/Downloads/teambition/<taskId>/` 目录（可由用户指定其他路径）
+- **单文件超过 2 GB 时必须先告知大小并明确征得用户同意再下载**
+- 不对下载的文件做任何二次上传、转发或加工
+
+---
+
+## 认证流程
+
+本技能使用**两套 API**，各有独立认证：
+
+### 1. Teambition Open API（主要）
+
+用于查询任意任务详情、活动记录和项目列表，不受角色限制。
+
+**所有请求经钉钉代理转发**（`$DINGTALK_PROXY_URL`），代理服务端托管 Teambition 应用凭证并签发 JWT。技能端不持有 AppId/SecretKey，也不签发 JWT。
+
+### 2. 钉钉项目 API（补充，通过代理）
+
+用于搜索用户自己参与的任务（按角色过滤）和获取员工信息。企业级 token 由代理管理，技能端不接触凭据。
+
+**代理地址：** `$DINGTALK_PROXY_URL`（默认 `http://claude.server22.jz/api/dingtalk/proxy`）
+
+**认证方式**（参考 `dingtalk-docs` 技能）：
+
+- **proxyToken**（个人用户）：`X-Proxy-Token` + `X-User-Id`
+- **robot key**（机器人用户）：`Authorization: Bearer <robot_token>`
+  - robot_token 获取：`POST $DINGTALK_DOMAIN/api/v1/token`，请求体 `{"api_key": "rk-..."}`，返回 `{"token": "...", "expires_in": 3600}`
+
+**所需钉钉权限：** `Project.Task.Read.All`、`Project.Task.Write.All`、`qyapi_project`
+
+**所需 Teambition Open API Scope：**
+- 读取：`tb-core:task:list`、`tb-core:teambition:file:get`
+- 写入：`tbs-core:task:update`（更新任务）、评论发布无需额外 scope
+
+### 凭据初始化
+
+每次执行 API 调用时，按以下优先级获取凭据：
+
+1. 环境变量 `$DINGTALK_PROXY_TOKEN` / `$DINGTALK_UNION_ID`（如已设置）
+2. 本地文件 `~/.config/jz-dingtalk/proxy-token` + `~/.config/jz-dingtalk/user.json`
+
+**在每个包含 API curl 调用的 Bash 块开头，执行凭据初始化：**
+
+```bash
+# 环境变量未设置时从本地文件读取（claude-code-server 文件由 start_session 预置）
+[ -z "$DINGTALK_PROXY_TOKEN" ] && [ -f ~/.config/jz-dingtalk/proxy-token ] && DINGTALK_PROXY_TOKEN=$(cat ~/.config/jz-dingtalk/proxy-token)
+[ -z "$DINGTALK_UNION_ID" ] && [ -f ~/.config/jz-dingtalk/user.json ] && DINGTALK_UNION_ID=$(python3 -c "import json;print(json.load(open('$HOME/.config/jz-dingtalk/user.json'))['unionId'])")
+```
+
+⚠️ 若本地文件不存在，提示用户前往 `http://claude.server22.jz/dingtalk-auth` 完成钉钉授权。
+
+---
+
+## 核心项目索引
+
+用户查询任务时，优先在核心项目中搜索。项目按重要程度分为两级。
+
+### 一类核心（研发主项目）
+
+| 项目名称 | Project ID | 说明 |
+|---------|-----------|------|
+| 迦智需求池 | `631710f1ac04e183d048d326` | 研发需求跟踪，功能开发任务 |
+| jz-bug | `635bb5cec3bd1e0fb4113544` | 产品 bug 跟踪 |
+| 现场项目信息 | `616e6868a46ec51df166f4cd` | 现场部署、项目实施问
+
+---
+## Skill: task-engine-troubleshoot
+
+# 任务引擎排障（web-service + async-service）
+
+针对 **车载任务链路**：前端 / carly-web → **web-service**（必参与）↔ **async-service**（仅实际下发行为树时参与）。整机泛泛诊断请用 `robot-diagnosis`，上机只读操作用 `robot-peek` 或 `remote-hand`。
+
+## 与其他技能的边界
+
+| 情况 | 应使用 |
+|------|--------|
+| 任务链路问题（任务卡住/没执行/行为树异常等） | **本技能** |
+| 整机健康巡检、多模块泛泛排查 | `robot-diagnosis` |
+| 只需要上机看日志/状态，不涉及任务链路 | `robot-peek` / `remote-hand` |
+| 纯导航/硬件/agent 问题（已定界排除任务引擎） | 按定界结果转相应团队 |
+
+若用户只说"车有问题"而未提及任务，优先走 `robot-diagnosis`；用户明确指向任务行为时才用本技能。
+
+## 必读完整手册
+
+详细排障流程、grep 命令、接口表、场景说明均在 **`task-engine-playbook.md`**（同目录下）。使用前请先读取该文件，然后按下方步骤执行。
+
+## 排查步骤
+
+> **定界完成即可停止**——不必走完全部步骤。一旦把问题归到某个组件边界（修 or 交接），直接跳到第 7/8 步收口。
+
+1. **确认版本** — 问清 ws/async 的 deb/tag/commit。若版本偏旧，先按 playbook §1.10 查上游是否已修复，有则建议升级。
+2. **判断是否涉及 async** — 读 §1.2a：若步骤无 `bt` 前缀且 ws 日志无"行为树启动"字样，只查 `web-service.log`；若已定界为纯 BT 内问题，可先只查 `async-service*.log`。
+3. **定界** — 按决策树（§1.3）判断问题落在哪一段（carly-web / ws / async / agent / iosys）。
+4. **日志检索** — 按第四章场景执行 grep。版本一致时可按 §2.0 的文件+行号速跳源码；对不上则改关键字搜索，并记录版本偏差。
+5. **线程与并发** — 若涉及 join/preempt/mutex/回调窗口等表象，读 §3.4 对齐时间线。
+6. **接口与状态** — 查第三章 KV/topic 及第六章命令集。
+7. **定界为外部组件** — 按 §1.8 整理交接材料（假设列表 + 接口验证 + 版本核对）。
+8. **提出修复方案** — 按 §1.9：**先方案、使用者确认后再改**。代码修复须想清根因与影响。
+9. **控制修复范围** — 按 §1.7：能单端解决就不双端改。
+
+## 常见坑
+
+| 坑 | 后果 | 对策 |
+|----|------|------|
+| 一上来就同时 grep `web-service.log` 和 `async-service*.log` | 浪费时间，被无关 BT 噪声带偏 | 先按 §1.2a 判断本条任务是否真动到 BT |
+| 不问版本就开始翻代码 | 行号、分支对不上，结论全错 | 起手先按 §1.10 拿 deb/tag/commit，再决定看哪棵源码 |
+| 「保险起见」ws 和 async 各打一块补丁 | 双端 review、回归面扩大、版本错配组合不可控 | §1.7：先定责任侧，单端最小改动收口 |
+| 没确认就直接改代码、发版 | 引入二阶问题、契约破坏 | §1.9：先给方案+影响面，等使用者确认 |
+| 定界已到外部组件还继续在 ws/async 里钻 | 越查越偏 | §1.8：交接清单（假设 + 接口验证 + 版本）写清楚转给对应团队 |
+
+---
+## Skill: device-log-analyzer
+
+# 设备日志分析技能
+
+分析 `/opt/jz/log/` 目录下的 jrosth*.log 和 jzhw*.log 日志文件，诊断激光雷达和深度相机问题。
+
+## 与其他诊断技能的协作
+
+| 场景 | 应使用 |
+|------|--------|
+| **本技能的定位** | 传感器（激光 / 相机）专项日志分析 |
+| **上游**：robot-diagnosis → 本技能 | `robot-diagnosis` → 本技能 |
+| **依赖**：本技能只分析日志，**不负责拉取日志**——内网走 `robot-peek`，客户现场走 `remote-hand` | `robot-peek` / `remote-hand` |
+| **下游**：传感器数据确认正常但 scan_filter 输出异常（滤波/盲区/融合问题） | `scan-filter-diagnosis` |
+| **下游**：定位结论非传感器/驱动问题（例如是任务编排或系统层）| 回退到 `robot-diagnosis` 或转 `task-engine-troubleshoot` |
+| **并行**：iosys 包内（IO 板、激光、相机等）问题已涉及任务链路 | 与 `task-engine-troubleshoot` playbook §1.3 Q5 交叉看 |
+| **下游**：传感器数据确认无驱动问题，但属于嵌入式硬件层故障（电机/IO/总线/电源等） | `embedded-troubleshoot` — 嵌入式硬件知识库 |
+
+入口可以是用户直接命中（"激光雷达没数据"），也可以是 `robot-diagnosis` 巡检后路由到传感器/设备排查方向。**不要承接** "看下车有啥问题" 这种泛泛需求——先让 robot-diagnosis 收口再决定是否进本技能。
+
+## 日志文件说明
+
+### 主要日志（优先分析）
+
+| 文件名 | 内容说明 |
+|--------|----------|
+| `jrosth.log` | 主驱动日志（1.2409之前版本） |
+| `jrosth-laser2d.log` | 2D激光雷达日志（1.2409及以后） |
+| `jrosth-laser3d.log` | 3D激光雷达日志 |
+| `jrosth-camera.log` | 深度相机日志（1.2409及以后） |
+| `iosys_iobox.log` | IO板激光日志 |
+| `iosys_camera_node_{位置}.log` | JZ相机日志 |
+
+### 备选日志（无上述文件时分析）
+
+| 文件名 | 内容说明 |
+|--------|----------|
+| `jzhw_node_subp.log` | 硬件子进程日志 |
+| `jzhw_node.log` | 硬件节点主日志 |
+| `jzhw_node_err.log` | 错误日志 |
+
+### 日志格式
+
+```
+# Jrosth格式
+[2025-11-24 10:27:07.285] INFO/ERROR 消息 [源文件:行号] 线程名
+
+# Jzhw格式
+[2026-05-15 00:00:00.455][WARNING/ERROR][进程ID] [函数名] 消息 (源文件:行号)
+```
+
+## 分析流程
+
+1. **定位日志**：使用 Glob 查找 jrosth*.log，无则查找 jzhw*.log
+2. **识别问题**：根据错误模式判断问题类型
+3. **生成报告**：时间精确到秒（YYYY-MM-DD HH:MM:SS）
+
+## 问题类型与解决方案
+
+### 类型1：设备断连
+
+**特征**：`disconnect`、`timeout`、`check device cost:0 second`（重复）、`Connection activation failed`
+
+**解决**：检查网线/电源 → ping测试 → 检查IP配置 → 重启设备 → 更换网线
+
+### 类型2：驱动未启动
+
+**特征**：`ros node init` 持续重复、`Failed to register publisher`、`ROS_MASTER_URI` 错误
+
+**解决**：确认roscore运行 → 检查环境变量 → 验证launch配置 → 检查依赖
+
+### 类型3：驱动启动但无数据
+
+**特征**：`check device cost:0 second` 持续但无数据、`Skipped loading plugin`
+
+**解决**：确认设备型号匹配 → 检查Topic → 测试数据流
+
+---
+
+## 激光雷达问题排查
+
+> 来源：钉钉文档「激光问题排查指南」
+
+### 通用问题
+
+| 问题 | 解决方法 |
+|------|----------|
+| 激光偶现无连接 | jrosth 2.2506已修复；2412用1.2412.21+；2503用2.2503.11+ |
+| 2409版本无数据 | 需要参数：`j3/jzhw/model/laser/{}/angle_resolution` |
+| 前后激光点云不同步 | 检查是否同一品牌、是否均为导航激光 |
+
+### 万集激光（wj716n/wj718h/wj719x）
+
+| 问题 | 解决方法 |
+|------|----------|
+| UDP参数一致但无数据 | 检查目的端口是否被占用 |
+| wj716n设置参数失败 | 更新上位机版本 |
+| wj718h设置UDP失败 | 检查SN码，718X开头无需设置UDP |
+| wj719x防护罩噪点 | jrosth更新到2.2512+，使用角度过滤功能 |
+| wj716n IO板偶发断联 | 检查是否25hz，改15hz后仍复现则排查硬件 |
+
+**工具**：wjtools
+
+### 欧蕾激光
+
+| 问题 | 解决方法 |
+|------|----------|
+| 2412+点云丢失 | 回退版本（1.2412.21-ole或2.2506.4+） |
+| 偶发无数据 | 需本地编译驱动，联系基线 |
+
+### sick/tim激光
+
+| 问题 | 解决方法 |
+|------|----------|
+| tim240无数据 | 升级jrosth到1.2403.4+sg或2.2506.5+ |
+| sick300频繁断联 | 排查硬件（网口、网线、工控机） |
+
+### 倍加福激光
+
+| 问题 | 解决方法 |
+|------|----------|
+| pf2000开机无数据 | UDP连接则重启/改用TCP |
+
+---
+
+## 深度相机问题排查
+
+> 来源：钉钉文档「相机问题排查指南」
+
+### JZ相机
+
+| 问题 | 解决方法 |
+|------|----------|
+| 相机未连接 | `lsusb` 查看设备 |
+| 设置cameraID失败 | `circusctrl stop jzhw_node/jjobs/iosys_daemon` |
+
+### AST（奥比）相机
+
+---
+## Skill: robot-model-config
+
+# 机型配置 + 机型类问题诊断
+
+帮助开发者在迦智机器人上完成机型设置、机型参数配置、机型检查，以及**从症状反向定位到机型配置根因**的问题诊断。
+
+## 与其他诊断技能的协作
+
+本技能在「诊断技能全景」中是**专项分析层**之一，专管机型配置侧的设置和反诊。
+
+| 场景 | 应使用 |
+|------|--------|
+| 设置 / 切换 / 新建 / 修改机型 → 场景一～四 | **本技能** |
+| 机型配置完整性检查（"配全了吗"） → 场景五 | **本技能** |
+| **从症状反推机型根因**（车跑偏、切机型后某功能没了、`/j3/` 参数缺失等）→ 场景六 | **本技能** |
+| 整机泛泛排查（"车有什么问题"） | `robot-diagnosis` → 症状路由到本技能（如已定界为机型问题）|
+| 任务/行为树异常 | `task-engine-troubleshoot` |
+| 传感器驱动 / jrosth / jzhw 日志 | `device-log-analyzer` |
+| 上机执行只读命令（拉日志、查进程） | `robot-peek`（内网）/ `remote-hand`（客户现场）|
+
+**入口提示**：若用户开口是"车跑偏"、"切机型后某功能没了"、"日志里报 `/j3/...` 参数缺失"这类**已隐含机型嫌疑**的描述，直接进场景六；若只是"车有问题"，先让 `robot-diagnosis` 跑系统巡检，定界到机型层再调本技能。
+
+---
+
+## 安全规则
+
+### 机器人连接
+
+本技能需要在机器人上执行命令。可通过以下方式连接：
+- `robot-peek` 技能：连接内网机器人（172.x.x.x）
+- `remote-hand` 技能：通过 FRP 隧道连接客户现场机器人
+- 用户自行提供的 SSH 会话
+
+无论通过何种方式连接，均遵守以下安全规则：
+- 只读命令直接执行，写操作需用户确认
+- **机型配置是生产环境的刚需**，172.23.* 网段不予禁止。但写操作分级确认机制仍然适用。
+
+**CTU/穿梭车注意：** CTU 使用 `root` 用户（非 `jz`），Buildroot 系统无 ROS 环境。`emma_*` 命令在 CTU 上同样可用，但写操作**不需要** `source /opt/ros/*/setup.bash`（CTU 没有 ROS）。`rosparam get` 不可用——用 `emma_status -v` 或 ADELE3 页面查看参数。
+
+### 密码编码存储
+
+密码已 base64 编码存储，使用时解码：
+
+```bash
+echo 'cm9ib3QxMjM=' | base64 -d
+# 产出: robot123
+```
+
+Bash 命令中用 `"$(echo 'cm9ib3QxMjM=' | base64 -d)"` 代替明文。
+
+### 机型写操作分级
+
+机型配置涉及大量写操作。以下按风险分级：
+
+**查询类（只读，直接执行）：**
+- `emma_status -v`、`emma_list`、`emma_history list`、`emma_checksum`
+- `rosparam get /j3/...` 读取单个参数（**只限读**）
+- 通过 ADELE3 页面查看参数（只读浏览）
+
+> **sudo 提权：** emma 指令部分操作需要 root 权限。sudo 不继承用户 PATH，需用绝对路径：`echo "$(echo 'cm9ib3QxMjM=' | base64 -d)" | sudo -S /opt/jz/bin/emma_status -v`。迦智自有命令统一安装在 `/opt/jz/bin/`。
+
+**低风险写操作（确认后执行）：**
+- `emma_configure <model>` — 切换机型
+- `emma_create <model>` — 新建机型（不影响当前运行）
+
+**中风险写操作（需明确确认并说明影响）：**
+- `emma_mod <key> <value>` — 修改单个参数（**修改机型的唯一途径**，前端 ADELE3 最终也是调此指令）
+
+**高风险写操作（需用户强确认）：**
+- `emma_reset` — 重置所有本地机型数据
+- 批量修改机型参数
+
+> **严禁使用 `rosparam set` 修改机型参数。** 系统监控会判定为异常。`rosparam` 仅限读取机型数据。
+
+---
+
+## 前置知识
+
+### 机型系统架构
+
+第三代机型系统（emma）将配置数据分为 5 大类，所有属性 key 统一加前缀 `/j3/`：
+
+| 类别 | 编号范围 | 说明 |
+|------|---------|------|
+| 名称属性 | 10001-19999 | 机型名字、版本等标识信息 |
+| 整机属性 | 20001-29999 | 整车维度参数（架构、语言、依赖等） |
+| 硬件组成 | 30001-39999 | 可选硬件设备（激光、相机、IO板、arm等） |
+| 公共属性 | 100001-199999 | 多模块共享的配置项 |
+| 模块属性 | 200001-299999 | 单模块自用的配置项 |
+
+数据分四层来源，最终生效值（j3）按优先级规则合并生成：
+
+| 层 | 来源 | 说明 |
+|----|------|------|
+| **j0** | 软件包内置 | `jcar3-params` deb 包提供，只读 |
+| **j1** | 单机数据 | 本地写入的单机配置，可写 |
+| **j2** | 动态数据 | 过程中可能被改动的数据（如标定值），可写 |
+| **j3** | 最终生效值 | 由数据运行器按规则合并 j0/j1/j2 生成 |
+
+**生效规则：** 对每个参数，依次查找 j2 → j1 → j0，取最先找到的值作为 j3。即 **j2 > j1 > j0**。
+
+命令行中读取参数时看到的 `/j3/...` 即为最终生效值。普通修改机型参数写入 j1 层，标定等过程中可变数据写入 j2 层，j2 层的值会覆盖 j1 层同名参数。
+
+### 参数编号与命名空间
+
+每个参数有一个编号（如 10001、35001），同时有一个 `name` 字段，对应运行时的参数路径。例如：
+
+- 编号 `10001` → name `robot_assembler_type` → 运行时路径 `/j3/robot_assembler_type`
+- 编号 `20001` → name `env/distributed_type` → 运行时路径 `/j3/env/distributed_type`
+- 编号 `35001` → name `jzhw/model/laser/<index>/name` → 运行时路径 `/j3/jzhw/model/laser/1/name`
+
+因此运行时 `rosparam list /j3/` 看到的是功能命名空间（`global/`、`env/`、
+
+---
+## 导航错误码 Playbook
+
+---
+### 614002-map_parse_error
+<!-- AUTO-GENERATED by generate_agent_docs.py; do not edit directly. -->
+<!-- Source: nav-navigation-errors/614002-map_parse_error.md -->
+
+# JState 错误码 614002：地图异常
+
+> 文档用途：当 AI Agent 在现场日志中发现 `614002` 时，用本文区分“地图更新失败”和“任务节点属性非法”两条触发链，并根据同期日志选择下一步排查方向、处置方式和验证方法。
+
+> Agent 视图：仅保留结论、诊断决策、证据/输出契约和 Playbook。完整原文见 [614002-map_parse_error.md](../nav-navigation-errors/614002-map_parse_error.md)。
+
+## 1 错误结论
+
+| 字段 | 内容 |
+|---|---|
+| 错误码 | `614002` |
+| JState Key | `/jstate/error/nav-manager/map_parse_error` |
+| 错误描述 | 地图异常 |
+| 等级 | `level5`，nav-manager 内部为 `ERROR` |
+| 直接触发条件 | 地图更新返回失败，或任务路径节点属性校验返回 `NODE_ATTRIBUTES_ERROR` |
+| 直接影响 | 地图更新链中地图管理器保持未启动；任务校验链中当前导航任务被拒绝 |
+| 内部清除条件 | 后续地图更新成功，或任务重置时统一清除 |
+| 错误注册追溯 | `c49ab2f11683565b9c0588dbc33ac3efe8030d35`（2025-03-26，地图热更新相关变更） |
+| 本文验证基线 | `RC/1.2603.x @ 744cfcbe352b` |
+| 适用前提 | 机器人运行版本使用本文所述的 `MapManager`、`NavPlugin` 和 `TaskInfoGuider` |
+| META 来源 | `机型3代状态数据-META大全.xlsx` → `异常状态s3` → 第 437 行 |
+
+**核心判断**：`614002` 不是单一的“地图 JSON 解析失败”。当前源码存在两条独立触发链：
+
+1. nav-manager 获取、解析或构建地图失败。
+2. nav-base 收到的任务路径节点属性非法。
+
+AI Agent 必须先从日志判断触发链，再分析根因。看到 `614002` 就直接重新下发地图，可能掩盖调度任务字段问题。
+
+本文使用以下证据状态：
+
+| 状态 | 含义 |
+|---|---|
+| `已确认` | META、源码或现场原始日志可直接证明 |
+| `高可能` | 特征与某一原因高度吻合，但仍缺少生产者侧直接证据 |
+| `待确认` | 当前只能作为排查方向 |
+| `已排除` | 正常判据或反向证据已经排除该原因 |
+
+## 3 结合日志选择排查方向
+
+先保留错误前后至少 30 秒的原始日志，再提取关键特征：
+
+```bash
+grep -E "map_parse_error|updateMap|\\[MapManager\\]|getNewMapInfo|update map|create graph base fail|map is empty|parse path_node failed|GOAL WITH INCOMPLETE" \
+  /opt/jz/log/nav-manager.log | tail -n 300
+```
+
+按顺序执行：
+
+| 顺序 | 检查项 | 正常判据 | 异常判据 | 结论状态与下一步 |
+|---:|---|---|---|---|
+| 1 | 时间与版本 | JState 和日志属于同一进程、同一时间窗，版本适用本文 | 时间、启动 UUID、版本或日志不一致 | 标记`待确认`，重新取得正确证据 |
+| 2 | 触发链 | 能找到地图更新日志或 `parse path_node failed` | 两类特征均不存在 | 扩大时间窗并检查旧版本日志格式 |
+| 3 | 地图服务调用 | `/map_master/get_current_map_info` 可用且调用成功 | `getNewMapInfo serviceCall fail` | 地图服务通信异常标记为`高可能` |
+| 4 | 地图响应 | 响应成功，内容可解析且包含有效节点和边 | `response.success=false`、异常文本或 `map is empty` | 地图数据生产侧异常标记为`高可能`；同时注意可能不
+
+---
+### 614006-other_reason
+<!-- AUTO-GENERATED by generate_agent_docs.py; do not edit directly. -->
+<!-- Source: nav-navigation-errors/614006-other_reason.md -->
+
+# JState 错误码 614006：调度要求到点精度阈值过高，本体无法满足
+
+> 文档用途：当 AI Agent 在现场日志中发现 `614006` 时，用本文理解该错误码的注册信息、META 描述含义，以及在当前代码基线中的证据边界。
+
+> Agent 视图：仅保留结论、诊断决策、证据/输出契约和 Playbook。完整原文见 [614006-other_reason.md](../nav-navigation-errors/614006-other_reason.md)。
+
+## 1 错误结论
+
+| 字段 | 内容 |
+|---|---|
+| 错误码 | `614006` |
+| JState Key | `/jstate/error/nav-manager/other_reason` |
+| 错误描述（META） | 调度要求到点精度阈值过高，本体无法满足 |
+| 等级 | `level5`，nav-manager 内部为 `ERROR` |
+| 直接触发条件 | **当前代码基线中未找到置位调用**。注册表中描述为调度空间管理 footprint 配置不匹配。 |
+| 直接影响 | 未知。ERROR 级别在触发态下最多发布 `/route/error` 3 次后停止。 |
+| 自动恢复条件 | **当前代码基线中未找到清除调用**。依赖 `HealthMonitor::exit()` 任务重置时统一清除。 |
+| 本文验证基线 | `RC/1.2603.x @ 744cfcbe352b` |
+| 适用前提 | 机器人运行版本中包含该错误码的 META 注册 |
+| META 来源 | `机型3代状态数据-META大全.xlsx` → `异常状态s3` → 第 441 行 |
+
+**核心判断**：`614006` 在 META XLSX 中注册为 "调度要求到点精度阈值过高，本体无法满足"，内部 key 为 `other_reason`。在 Java-monitor 源码中，`OTHER_REASON` 枚举已定义 (`abnormal_ids.h:53`) 并在 `health_monitor.cpp:122-123` 注册，但**当前本仓库代码基线中没有任何 `setStatus(OTHER_REASON, ...)` 的调用**。这意味着：
+
+1. 该错误码的置位逻辑可能在其他仓库（如 nav-net、carrier-rotater）或通过 JState 外部 API 直接写入。
+2. 可能是一个已废弃但未从注册表中清理的错误码。
+3. 可能通过其他模块（如调度系统）的 ROS 消息间接触发。
+
+本文基于现有证据给出排查方向，但不能给出根因分类。
+
+本文使用以下证据状态：
+
+| 状态 | 含义 |
+|---|---|
+| `已确认` | META、源码或现场原始日志可直接证明 |
+| `高可能` | 特征与某一原因高度吻合，但仍缺少直接证据 |
+| `待确认` | 当前只能作为排查方向 |
+| `已排除` | 正常判据或反向证据已经排除该原因 |
+
+## 3 结合日志选择排查方向
+
+由于当前代码基线没有置位逻辑，现场出现 `614006` 时，排查策略是：确定哪个外部模块触发了这个错误码。
+
+先提取错误前后至少 120 秒的日志：
+
+```bash
+grep -E "other_reason|precision|footprint|feasible_region|精度|调度" \
+  /opt/jz/log/nav-manager.log | tail -n 500
+```
+
+按顺序执行：
+
+| 顺序 | 检查项 | 正常判据 | 异常判据 | 结论状态与下一步 |
+|---:|---|---|---|---|
+| 1 | 时间与版本 | JState、日志和任务属于同一时间窗 | 时间、任务或版本不一致 | 标记`待确认`并重新取证 |
+| 2 | 错误来源确认 | 能从 `/route/error` 中确认 `other_reason` 出现 | JState 中出现但日志中无对应事件 | 错误可能从外部模块写入 JState，非 nav-manager 本地触发 |
+| 3 | 调度任务上下文 | 错误出现时能找到对应的 dispatch 任务及其精度参数 | 无相关调度日志 | 扩大日志范围到调度系统 |
+| 4 | precision
+
+---
+### 614013-prune_error
+<!-- AUTO-GENERATED by generate_agent_docs.py; do not edit directly. -->
+<!-- Source: nav-navigation-errors/614013-prune_error.md -->
+
+# JState 错误码 614013：裁断异常
+
+> 文档用途：当 AI Agent 在现场日志中发现 `614013` 时，用本文理解该错误码的 META 注册信息、pruner 模块的裁断机制，以及在当前代码基线中的证据边界。
+
+> Agent 视图：仅保留结论、诊断决策、证据/输出契约和 Playbook。完整原文见 [614013-prune_error.md](../nav-navigation-errors/614013-prune_error.md)。
+
+## 1 错误结论
+
+| 字段 | 内容 |
+|---|---|
+| 错误码 | `614013` |
+| JState Key | `/jstate/error/nav-manager/prune_error` |
+| 错误描述（META） | 裁断异常（path prune abnormal） |
+| 等级 | `level1`，nav-manager 内部应映射为 `WARN`（META 登记为 `level1`） |
+| 直接触发条件 | **当前代码基线的 `health_monitor.cpp` 中未注册此错误码，本仓库无 `PRUNE_ERROR` 枚举或 `setStatus` 调用。** |
+| 直接影响 | 未知。pruner 模块的裁断失败通常不影响安全性——裁断失败时默认保留原路径不作削减。 |
+| 自动恢复条件 | 未知。若实现为 WARN 级别，则置 false 后发布 3 次停止。 |
+| 本文验证基线 | `RC/1.2603.x @ 744cfcbe352b` |
+| 适用前提 | 机器人运行版本中包含该错误码的 META 记录 |
+| META 来源 | `机型3代状态数据-META大全.xlsx` → `异常状态s3` → 第 448 行 |
+
+**核心判断**：`614013`（prune_error / 裁断异常）在 META XLSX 中注册但**不在当前代码基线的 `health_monitor.cpp` 注册列表中**。`AbnormalIds` 枚举 (`abnormal_ids.h`) 中没有 `PRUNE_ERROR`，全仓库搜不到 `prune_error` 或 `PRUNE_ERROR` 字符串。
+
+但 `pruner` 模块本身在代码中是存在的（`manager/src/code_inserting/pruner.cpp/h`），负责路径裁断（根据定位类型、轨迹切换点、折角等条件削减路径点）。裁断逻辑中多处有失败处理和日志输出，但没有关联到任何 `HealthMonitor` 异常状态。
+
+可能情况：
+1. META 中预先注册但从未在代码中实现。
+2. 在其他仓库或版本中实现，但当前基线没有。
+3. 已废弃但未从 META 中清理。
+
+本文基于 pruner 模块的裁断机制给出排查方向，但无法给出根因分类。
+
+本文使用以下证据状态：
+
+| 状态 | 含义 |
+|---|---|
+| `已确认` | META、源码或现场原始日志可直接证明 |
+| `高可能` | 特征与某一原因高度吻合，但仍缺少直接证据 |
+| `待确认` | 当前只能作为排查方向 |
+| `已排除` | 正常判据或反向证据已经排除该原因 |
+
+## 3 结合日志选择排查方向
+
+先提取错误前后至少 120 秒的日志：
+
+```bash
+grep -E "prune|裁断|n_reason|hard_prune|Pruner" \
+  /opt/jz/log/nav-manager.log | tail -n 500
+```
+
+按顺序执行：
+
+| 顺序 | 检查项 | 正常判据 | 异常判据 | 结论状态与下一步 |
+|---:|---|---|---|---|
+| 1 | 时间与版本 | JState、日志和任务属于同一时间窗 | 时间、任务或版本不一致 | 标记`待确认`并重新取证 |
+| 2 | 错误来源确认 | 能从 `/route/error` 确认 `prune_error` 出现 | 仅在 META 中注册但日志未出现 | pruner 的裁断失败日志 ≠ prune_error 错误码 |
+| 3 | 裁断日志 | pruner 正常工作，无异常裁断 | pruner 输出 `LOGEE`/`LOGEW` 级别裁断异常 | 裁断异常可能但不一定触发 pru
+
+---
+### 614028-qrcode_missed
+<!-- AUTO-GENERATED by generate_agent_docs.py; do not edit directly. -->
+<!-- Source: nav-navigation-errors/614028-qrcode_missed.md -->
+
+# JState 错误码 614028：二维码识别异常
+
+> 文档用途：当 AI Agent 在现场日志中发现 `614028` 时，用本文判断错误发生在二维码导航起步、定位切换还是导航结束阶段，并沿二维码消息链定位无数据、数据过期或未识别等原因。
+
+> Agent 视图：仅保留结论、诊断决策、证据/输出契约和 Playbook。完整原文见 [614028-qrcode_missed.md](../nav-navigation-errors/614028-qrcode_missed.md)。
+
+## 1 错误结论
+
+| 字段 | 内容 |
+|---|---|
+| 错误码 | `614028` |
+| JState Key | `/jstate/error/nav-manager/qrcode_missed` |
+| 错误描述 | 二维码识别异常，请检查相机与码的状态 |
+| 等级 | `level5`，nav-manager 内部为 `ERROR` |
+| 直接触发条件 | 二维码定位模式下，`AbnormalCheck::qrcodeCheck()` 返回 `false` |
+| 直接影响 | 起步/定位切换时拒绝当前任务；导航结束时将 move-base 结果重置为 `ABORTED` 并返回任务失败 |
+| 内部清除条件 | 下一任务开始或任务重置时由 `HealthMonitor::exit()` 统一清除 |
+| 当前注册行变更记录 | `19c4ba6ad5c9e5a5d2f3cd5b393c9fc2e180df0c`（2025-03-10） |
+| 本文验证基线 | `RC/1.2603.x @ 744cfcbe352b` |
+| 适用前提 | 机器人运行版本使用 `/sensor_detector/visualmarks` 和本文所述的 `qrcodeCheck()` |
+| META 来源 | `机型3代状态数据-META大全.xlsx` → `异常状态s3` → 第 463 行 |
+
+**核心判断**：`614028` 只在当前定位类型为 `HETEMAP`（二维码定位）时触发。源码中的直接失败条件有三类：
+
+1. `/sensor_detector/visualmarks` 没有可用缓存消息。
+2. 第一条 landmark 的 ID 小于或等于 `-1`。
+3. landmark 消息时间戳距当前 ROS 时间达到或超过 `1` 秒。
+
+因此，错误描述中的“检查相机与码”只是排查方向，不代表相机硬件已经被证明故障。
+
+本文使用以下证据状态：
+
+| 状态 | 含义 |
+|---|---|
+| `已确认` | META、源码或现场原始日志可直接证明 |
+| `高可能` | 特征与某一原因高度吻合，但仍缺少发布者侧直接证据 |
+| `待确认` | 当前只能作为排查方向 |
+| `已排除` | 正常判据或反向证据已经排除该原因 |
+
+## 3 结合日志选择排查方向
+
+先保留错误前后至少 30 秒的原始日志，再提取关键特征：
+
+```bash
+grep -E "qrcode_missed|qrcodeCheck|visualmarks|二维码导航|localization_status|Task begin|movebase is finished" \
+  /opt/jz/log/nav-manager.log | tail -n 300
+```
+
+按顺序执行：
+
+| 顺序 | 检查项 | 正常判据 | 异常判据 | 结论状态与下一步 |
+|---:|---|---|---|---|
+| 1 | 时间与版本 | JState、日志和任务属于同一时间窗，版本适用本文 | 时间、任务或版本不一致 | 标记`待确认`并重新取证 |
+| 2 | 定位类型 | 触发时为 `HETEMAP` | 非 HETEMAP，且日志显示 `qrcodeCheck loc_type not hetemap` | 本调用链应通过；核对版本、时间窗和错误来源 |
+| 3 | 触发阶段 | 能由“起步时缺失”或“停止时缺失”确定阶段 | 阶段不明 | 扩大任务起止时间窗，不得假设任务影响 |
+| 4 | topic 发布 | `/sensor_detector/visualmarks` 有发布者且持续更新 | 无发布者、无消息或频率中断 | 消息链异常标记为`高可能`，转
+
+---
+### 614047-perception_internal_error
+<!-- AUTO-GENERATED by generate_agent_docs.py; do not edit directly. -->
+<!-- Source: nav-navigation-errors/614047-perception_internal_error.md -->
+
+# JState 错误码 614047：障碍物感知模块内部异常
+
+> 文档用途：当 AI Agent 在现场日志中发现 `614047` 时，用本文快速理解错误所在的功能流程，并根据同期日志选择下一步排查方向、处理措施和验证方法。
+
+> Agent 视图：仅保留结论、诊断决策、证据/输出契约和 Playbook。完整原文见 [614047-perception_internal_error.md](../nav-navigation-errors/614047-perception_internal_error.md)。
+
+## 1 错误结论
+
+| 字段 | 内容 |
+|---|---|
+| 错误码 | `614047` |
+| JState Key | `/jstate/error/nav-manager/perception_internal_error` |
+| 错误描述 | 障碍物感知模块内部异常 |
+| 等级 | `level1`，nav-manager 内部为 `WARN` |
+| 直接触发条件 | `jz_costmap_2d::CostmapModel::footprintCost()` 返回 `-1` |
+| 直接影响 | 当前候选路径被淘汰，或最终执行路径检查失败并触发重新规划 |
+| 自动恢复条件 | 后续路径检查中 `footprintCost()` 不再返回 `-1` |
+| 引入记录 | `19c4ba6ad5c9e5a5d2f3cd5b393c9fc2e180df0c`（2025-03-10，添加感知相关报错） |
+| 本文验证基线 | `RC/1.2603.x @ 744cfcbe352b` |
+| 适用前提 | 机器人运行版本包含该错误映射，且使用本文所述的 `SafetyInspectorImpl` 路径检查链 |
+| META 来源 | `机型3代状态数据-META大全.xlsx` → `异常状态s3` → 第 482 行 |
+
+**核心判断**：`614047` 表示 nav-manager 调用 costmap 检查路径时收到了“内部错误”返回值。它不是普通障碍物碰撞，也不同于感知数据超时 `614048` 和检测越界 `614049`。
+
+本仓库只能确认 costmap 返回了 `-1`，没有包含 `CostmapModel` 的实现源码。因此，AI Agent 必须结合机器人实际部署的 costmap 版本、输入数据和同期日志，继续确认 `-1` 来自哪个内部失败分支。
+
+本文使用以下证据状态：
+
+| 状态 | 含义 |
+|---|---|
+| `已确认` | META、源码或现场原始日志可直接证明 |
+| `高可能` | 特征与某一原因高度吻合，但仍缺少底层直接证据 |
+| `待确认` | 当前只能作为排查方向 |
+| `已排除` | 正常判据或反向证据已经排除该原因 |
+
+## 3 结合日志选择排查方向
+
+先提取错误前后至少 30 秒的日志：
+
+```bash
+grep -E "perception internal error|internal_error|\\[PathCheck\\]|\\[CPI\\] Execution path|mobility\\[enable_OA|\\[ReconfigPath\\]" \
+  /opt/jz/log/nav-manager.log | tail -n 300
+```
+
+按顺序执行下表。命中异常判据后，先完成该分支取证，不要无条件继续尝试后面的所有原因。
+
+| 顺序 | 检查项 | 正常判据 | 异常判据 | 结论状态与下一步 |
+|---:|---|---|---|---|
+| 1 | 时间与版本 | JState、日志属于同一进程和时间窗，运行版本适用本文 | 时间戳、启动 UUID、版本或日志文件不一致 | 当前分析标记为`待确认`；重新取得正确时间窗和版本 |
+| 2 | 直接触发日志 | 出现 `costmap perception internal error` | 找不到该日志 | 不能证明本文调用链；核对旧版本日志格式和 JState 原始消息 |
+| 3 | 检查阶段 | 能确定为 `sampling` 或 `execution` | 阶段不明 | 扩大日志时间窗；不得假设任务影响 |
+| 4 | path 输入 | 

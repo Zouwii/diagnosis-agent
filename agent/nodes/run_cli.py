@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from agent.logger import log
 from agent.state import DiagnosisState
-from engine.analysis.external_providers import enrich_with_external_evidence
 from engine.utils import now_iso, write_json
 from engine.workflows import RunCaseRequest, run_case
 
@@ -70,7 +70,7 @@ def _request_from_state(state: DiagnosisState) -> RunCaseRequest:
         case_id=case_id,
         case_dir=case_dir,
         source_type=source_type,
-        symptom=str(state.get("symptom") or state.get("user_input") or ""),
+        symptom=str(state.get("symptom") or state.get("user_input") or "").replace("None", ""),
         time_window=str(state.get("time_window") or ""),
         task_id=_task_id(params),
         task_url=str(params.get("task_url") or ""),
@@ -90,19 +90,17 @@ def _request_from_state(state: DiagnosisState) -> RunCaseRequest:
 
 
 async def run_cli_workflow(state: DiagnosisState) -> DiagnosisState:
-    """Run the already modularized CLI workflow as one reliable graph node."""
+    """Collect materials only — LLM analysis happens in the next node."""
     request = _request_from_state(state)
-    log("run_cli_workflow", "CLI Engine 开始", source_type=request.source_type, case_id=request.case_id)
-    # The migrated workflow is synchronous. Keep the graph adapter direct and
-    # move whole Case jobs to a dedicated worker at deployment time; wrapping
-    # individual nodes in an ad-hoc thread makes cancellation/recovery opaque.
-    result = run_case(
-        request,
-        external_enricher=enrich_with_external_evidence if request.external_evidence else None,
-    )
+    # origin-split uses this node for collection only. RunCaseRequest is frozen,
+    # so derive a modified request instead of mutating it in place.
+    request = replace(request, analyze=False, external_evidence=False)
+
+    log("collect", "开始采集", source_type=request.source_type, case_id=request.case_id)
+
+    result = run_case(request, external_enricher=None)
 
     context = result.context
-    summary = dict(context.get("analysis_summary") or {})
     collection = result.collection
     case_dir = request.case_dir
     materials = {
@@ -121,27 +119,12 @@ async def run_cli_workflow(state: DiagnosisState) -> DiagnosisState:
     }
     write_json(case_dir / "collection.json", {**materials, "collected_at": now_iso()})
 
-    specialty = summary.get("specialty_findings", []) or []
     update: DiagnosisState = {
         "materials": materials,
         "collected_at": str(context.get("created_at") or now_iso()),
         "context": context,
-        "analysis_summary": summary,
-        "findings": list(summary.get("findings") or []),
-        "error_codes": list(summary.get("error_codes") or []),
-        "problem_type": str((summary.get("analysis_trace") or {}).get("problem_type") or "general"),
-        "deep_insights": list(summary.get("deep_insights") or []),
-        "specialty_hits": [str(item.get("skill") or item.get("title") or "") for item in specialty],
-        "analysis_route": list(summary.get("analysis_route") or []),
-        "conclusion_status": str(context.get("conclusion_status") or "insufficient_data"),
-        "report_path": str(case_dir / "report.md"),
-        "knowledge_draft_path": str(case_dir / "knowledge-draft.md"),
+        "findings": [],
+        "error_codes": [],
     }
-    log(
-        "run_cli_workflow",
-        "CLI Engine 完成",
-        case_id=request.case_id,
-        findings=len(update["findings"]),
-        conclusion=update["conclusion_status"],
-    )
+    log("collect", "采集完成", case_id=request.case_id, artifacts=len(collection.artifacts))
     return update

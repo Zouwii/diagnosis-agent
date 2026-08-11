@@ -58,6 +58,15 @@
           </select>
         </label>
 
+        <label>
+          引擎版本
+          <select id="version" name="version">
+            <option value="origin-v1">origin-v1 (DeepSeek 单次)</option>
+            <option value="origin-split">origin-split (engine 子函数)</option>
+            <option value="graph-v1">graph-v1 (LangGraph 后续)</option>
+          </select>
+        </label>
+
         <div class="mode-fields" data-mode="internal_robot">
           <label>机器人 IP<input id="robot-ip" placeholder="172.22.0.222"></label>
         </div>
@@ -73,7 +82,7 @@
           <label>服务器工作区路径（与上传二选一）<input id="log-path" placeholder="当前用户工作区内的路径"></label>
         </div>
 
-        <label class="full">问题现象<textarea id="symptom" required placeholder="请描述问题表现，例如：到点后旋转三圈停止"></textarea></label>
+        <label class="full">问题现象<textarea id="symptom" placeholder="选填。TB任务会自动从标题提取"></textarea></label>
         <label>问题时间<input id="time-window" placeholder="2026-08-03 10:00 或 昨天晚上"></label>
       </div>
       <div class="actions">
@@ -165,6 +174,7 @@
   function requestBody(uploadId) {
     const selectedMode = mode.value;
     const body = {
+      version: document.querySelector('#version').value,
       mode: selectedMode,
       symptom: document.querySelector('#symptom').value.trim(),
       time_window: document.querySelector('#time-window').value.trim() || null,
