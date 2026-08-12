@@ -5,8 +5,9 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from server.claude_origin import ClaudeOriginResult
 from server.case_runner import run_diagnosis
 
 
@@ -74,6 +75,40 @@ def seed_case(case_id: str, req) -> dict:
 
 
 class RunDiagnosisTests(unittest.IsolatedAsyncioTestCase):
+    async def test_claude_origin_runner_result_is_persisted_and_report_exposed(self) -> None:
+        req = make_request(mode="local_logs", symptom="Claude 诊断")
+        case_id = "case-api-claude"
+        case = seed_case(case_id, req)
+        with tempfile.TemporaryDirectory() as temp:
+            case_dir = Path(temp) / case_id
+            case_dir.mkdir()
+            report = case_dir / "report.md"
+            report.write_text("# Claude report\n", encoding="utf-8")
+            case["case_dir"] = str(case_dir)
+            fake = ClaudeOriginResult(True, report_path=str(report), session_id="session-test")
+            with patch("server.claude_origin.ClaudeOriginRunner") as runner_class, patch(
+                "server.case_runner.asyncio.to_thread", new=AsyncMock(return_value=fake)
+            ):
+                runner_class.return_value.run.return_value = fake
+                await run_diagnosis(case_id, case, req, version="claude-origin-v1")
+
+        self.assertEqual(case["status"], "awaiting_human")
+        self.assertEqual(case["runtime"]["session_id"], "session-test")
+        self.assertEqual(case["report_url"], f"/api/cases/{case_id}/report")
+
+    async def test_claude_origin_failure_does_not_remain_running(self) -> None:
+        req = make_request(mode="local_logs", symptom="材料不足")
+        case_id = "case-api-claude-failed"
+        case = seed_case(case_id, req)
+        fake = ClaudeOriginResult(False, error="材料不足：raw/ 为空", exit_code=1, session_id="session-failed")
+        with patch("server.claude_origin.ClaudeOriginRunner") as runner_class, patch(
+            "server.case_runner.asyncio.to_thread", new=AsyncMock(return_value=fake)
+        ):
+            runner_class.return_value.run.return_value = fake
+            await run_diagnosis(case_id, case, req, version="claude-origin-v1")
+        self.assertEqual(case["status"], "failed")
+        self.assertIn("材料不足", case["error"])
+
     async def test_success_invokes_graph_and_exposes_existing_report(self) -> None:
         req = make_request(
             mode="remote_site",
@@ -172,7 +207,5 @@ class RunDiagnosisTests(unittest.IsolatedAsyncioTestCase):
             await run_diagnosis(case_id, case, req)
 
         self.assertEqual(case["status"], "awaiting_human")
-
-
 if __name__ == "__main__":
     unittest.main()

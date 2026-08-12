@@ -16,6 +16,21 @@ PENDING_DIR="${DIAGKIT_ROOT}/.pending_users"
 export DIAGNOSIS_CLI="${SKILLS_DIR}/scripts/diagnosis"
 
 # ── 模型网关 ──────────────────────────────────────────────────
+# 优先从 management-system 的 ai/config.json 读取 API key
+AI_CONFIG=""
+for cfg in \
+  "/home/jz/zhr/management-system/backend/ai/config.json" \
+  "/home/jz/zhr/tb_tool_bt/backend/ai/config.json"; do
+  if [ -f "${cfg}" ]; then
+    AI_CONFIG="${cfg}"
+    break
+  fi
+done
+if [ -n "${AI_CONFIG}" ]; then
+  ANTHROPIC_API_KEY=$(python3 -c "import json; print(json.load(open('${AI_CONFIG}')).get('api_key',''))" 2>/dev/null || echo "")
+  ANTHROPIC_BASE_URL=$(python3 -c "import json; print(json.load(open('${AI_CONFIG}')).get('base_url','http://one-api.server22.jz'))" 2>/dev/null || echo "http://one-api.server22.jz")
+  ANTHROPIC_MODEL=$(python3 -c "import json; print(json.load(open('${AI_CONFIG}')).get('model','deepseek-v4-flash'))" 2>/dev/null || echo "deepseek-v4-flash")
+fi
 export ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
 export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://one-api.server22.jz}"
 export ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-deepseek-v4-flash}"
@@ -223,4 +238,11 @@ cat <<EOF
 EOF
 
 cd "${WORKSPACE_DIR}"
-exec claude --add-dir="${SKILLS_DIR}" --dangerously-skip-permissions
+
+# ── 模型参数 ──────────────────────────────────────────────────
+CLAUDE_ARGS=(--bare)
+if [ -n "${ANTHROPIC_MODEL:-}" ]; then
+  CLAUDE_ARGS+=(--model "${ANTHROPIC_MODEL}")
+fi
+
+exec claude "${CLAUDE_ARGS[@]}" "请按 CLAUDE.md 的指引开始，直接询问用户本次诊断的输入来源（机器人IP / TB链接 / frp端口+IP / 日志路径）。"

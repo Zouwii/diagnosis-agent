@@ -136,11 +136,12 @@ Diagnosis Agent 保留三条并行版本，不能把它们混为一个实现：
 
 | version | LangGraph 职责 | 流程语义 |
 |---|---|---|
+| `claude-origin-v1` | Claude 稳定模式 | Worker 直接调用非交互 Claude CLI，执行 `diagnosis-orchestrator` 并输出 Case 报告 |
 | `origin-v1` | 一个完整流程节点 | 一次性调用迁移后的 `diagnosis_cli`，完整复刻原始 orchestrator |
 | `origin-split` | 多个流程节点 | 调用拆分后的 `diagnosis_cli` 模块，完成与 origin-v1 等价的完整流程 |
 | `graph-v1` | 后续演进版本 | 在不破坏前两个版本的前提下演进新的图编排 |
 
-`origin-v1` 是兼容基线：必须保留 `diagnosis_cli` 的完整流程语义，不能改成单独的
+`claude-origin-v1` 是 6001 默认稳定模式；`origin-v1` 是兼容基线：必须保留 `diagnosis_cli` 的完整流程语义，不能改成单独的
 LLM prompt、单独的 `doc_agent` 调用或跳过分析步骤。
 
 `origin-split` 只是把同一套诊断流程拆成采集、分析、报告等节点；拆分后的节点合起来
@@ -201,6 +202,8 @@ Python 实现。`origin-v1` 使用迁移后的 `diagnosis_cli` 完整入口；`o
 | 03 | [source-docs 索引](docs/03-source-docs索引.md) | 知识源资产及生成方式 |
 | 05 | [开发指南](docs/05-开发指南.md) | 本地运行、测试、开发手册 |
 | 06 | [高频导航问题知识建设任务](docs/06-高频导航问题知识建设任务.md) | 知识建设专项任务 |
+| 07 | [V2 版本架构设计](docs/07-V2版本架构设计.md) | 6001 Claude 稳定路线 + 极简 LangGraph 实验路线 |
+| 08 | [一小时恢复 6001 执行清单](docs/08-一小时恢复6001执行清单.md) | Claude 原版路线的时间盒开发、部署与验收 TODO |
 
 - PRD: [../pm-learning/jz-product/05-技术支持诊断Agent-PRD.md](../pm-learning/jz-product/05-技术支持诊断Agent-PRD.md)
 - 系统架构: [../pm-learning/jz-product/07-技术支持诊断Agent-系统架构设计.md](../pm-learning/jz-product/07-技术支持诊断Agent-系统架构设计.md)

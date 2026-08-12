@@ -1,0 +1,4 @@
+interface:
+  display_name: "错误码分析文档生成器"
+  short_description: "从错误码注册表、源码和日志生成可执行的排障知识文档"
+  default_prompt: "使用 $error-code-analysis-doc-generator 根据错误码注册表、源码和日志生成 AI Agent 可逐步执行的排障文档。"

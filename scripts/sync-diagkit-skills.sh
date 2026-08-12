@@ -38,6 +38,17 @@ sshpass -p "${REMOTE_PASS}" scp -r -o StrictHostKeyChecking=no \
   "${LOCAL_CLAUDE_SKILLS}/skills/"* \
   "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/skills/"
 
+echo "[sync] 同步 scripts..."
+if [ -f "${LOCAL_CLAUDE_SKILLS}/scripts/diagnosis" ]; then
+  sshpass -p "${REMOTE_PASS}" ssh -o StrictHostKeyChecking=no "${REMOTE_USER}@${REMOTE_HOST}" \
+    "mkdir -p ${REMOTE_DIR}/scripts"
+  sshpass -p "${REMOTE_PASS}" scp -o StrictHostKeyChecking=no \
+    "${LOCAL_CLAUDE_SKILLS}/scripts/diagnosis" \
+    "${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_DIR}/scripts/diagnosis"
+  sshpass -p "${REMOTE_PASS}" ssh -o StrictHostKeyChecking=no "${REMOTE_USER}@${REMOTE_HOST}" \
+    "chmod +x ${REMOTE_DIR}/scripts/diagnosis"
+fi
+
 echo "[sync] 完成。服务器上的技能:"
 sshpass -p "${REMOTE_PASS}" ssh -o StrictHostKeyChecking=no "${REMOTE_USER}@${REMOTE_HOST}" \
   "ls ${REMOTE_DIR}/skills/"
