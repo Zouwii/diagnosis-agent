@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -68,9 +67,6 @@ async def run_diagnosis(
     persist: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Execute LangGraph and update the mutable API Case record in place."""
-    if version == "claude-origin-v1":
-        await _run_claude_origin(case_id, case, request, persist=persist)
-        return
     try:
         update_status(case, "collecting", f"开始诊断 [{version}]: {request.symptom}")
         add_progress(case, "graph", f"LangGraph 工作流已启动 (version={version})", event="node_start")
@@ -107,62 +103,6 @@ async def run_diagnosis(
         case["error"] = str(exc)
         if persist:
             persist(case)
-
-
-async def _run_claude_origin(
-    case_id: str,
-    case: dict[str, Any],
-    request: Any,
-    *,
-    persist: Callable[[dict[str, Any]], None] | None = None,
-) -> None:
-    """Run the stable Claude path without changing legacy graph semantics."""
-    try:
-        update_status(case, "collecting", f"开始诊断 [claude-origin-v1]: {request.symptom}")
-        if persist:
-            persist(case)
-
-        from server.claude_origin import ClaudeOriginRunner
-
-        runner = ClaudeOriginRunner(
-            case_id,
-            case,
-            request,
-            persist=persist,
-            progress=lambda node, message, event: add_progress(case, node, message, event=event),
-        )
-        result = await asyncio.to_thread(runner.run)
-        case["runtime"] = {
-            "name": "claude-origin-v1",
-            "session_id": result.session_id,
-            "exit_code": result.exit_code,
-            "timed_out": result.timed_out,
-        }
-        if result.collection:
-            artifacts = list(result.collection.get("artifacts") or [])
-            case["materials"] = {
-                "collected": bool(artifacts),
-                "source": result.collection.get("source") or request.mode,
-                "case_id": case_id,
-                "case_dir": str(case.get("case_dir") or ""),
-                "raw_dir": str(Path(str(case.get("case_dir") or "")) / "raw"),
-                "artifacts": artifacts,
-                "warnings": list(result.collection.get("warnings") or []),
-            }
-        if not result.ok:
-            raise RuntimeError(result.error or "Claude 原版诊断失败")
-        case["conclusion_status"] = "need_human"
-        case["report_path"] = result.report_path
-        case["report_url"] = f"/api/cases/{case_id}/report"
-        update_status(case, "awaiting_human", "诊断完成，等待人工确认")
-        if persist:
-            persist(case)
-    except Exception as exc:
-        update_status(case, "failed", str(exc))
-        case["error"] = str(exc)
-        if persist:
-            persist(case)
-
 
 def update_status(case: dict[str, Any], status: str, message: str = "") -> None:
     case["status"] = status

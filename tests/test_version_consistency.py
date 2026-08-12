@@ -24,11 +24,11 @@ def _normalized(value: Any, root: Path) -> Any:
 
 
 class VersionConsistencyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_origin_and_split_have_equivalent_local_case_results(self) -> None:
+    async def test_origin_and_graph_v1_have_equivalent_local_case_results(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
             results: dict[str, tuple[dict[str, Any], Path]] = {}
-            for version in ("origin-v1", "origin-split"):
+            for version in ("origin-v1", "graph-v1"):
                 root = base / version
                 uploads = root / "uploads"
                 uploads.mkdir(parents=True)
@@ -61,10 +61,10 @@ class VersionConsistencyTests(unittest.IsolatedAsyncioTestCase):
                 results[version] = (result, case_dir)
 
             origin_result, origin_dir = results["origin-v1"]
-            split_result, split_dir = results["origin-split"]
+            graph_result, graph_dir = results["graph-v1"]
             self.assertEqual(
                 _normalized(origin_result, origin_dir.parents[1]),
-                _normalized(split_result, split_dir.parents[1]),
+                _normalized(graph_result, graph_dir.parents[1]),
             )
 
             for filename in (
@@ -77,18 +77,18 @@ class VersionConsistencyTests(unittest.IsolatedAsyncioTestCase):
                 "next-prompt.md",
             ):
                 origin_path = origin_dir / filename
-                split_path = split_dir / filename
+                graph_path = graph_dir / filename
                 self.assertTrue(origin_path.is_file(), filename)
-                self.assertTrue(split_path.is_file(), filename)
+                self.assertTrue(graph_path.is_file(), filename)
                 if origin_path.suffix == ".json":
                     origin_value = json.loads(origin_path.read_text(encoding="utf-8"))
-                    split_value = json.loads(split_path.read_text(encoding="utf-8"))
+                    graph_value = json.loads(graph_path.read_text(encoding="utf-8"))
                 else:
                     origin_value = origin_path.read_text(encoding="utf-8")
-                    split_value = split_path.read_text(encoding="utf-8")
+                    graph_value = graph_path.read_text(encoding="utf-8")
                 self.assertEqual(
                     _normalized(origin_value, origin_dir.parents[1]),
-                    _normalized(split_value, split_dir.parents[1]),
+                    _normalized(graph_value, graph_dir.parents[1]),
                     filename,
                 )
 

@@ -1,4 +1,9 @@
-"""LangGraph diagnosis graphs — origin, origin-v1, origin-split, graph-v1."""
+"""LangGraph diagnosis graphs.
+
+``origin-v1`` is the single-node compatibility baseline. ``graph-v1`` is the
+structured workflow that evolves independently while keeping baseline output
+contracts compatible.
+"""
 
 from __future__ import annotations
 
@@ -7,7 +12,7 @@ import os
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 
-from agent.nodes.run_cli import run_cli_workflow
+from agent.nodes.collect import collect_materials
 from agent.nodes.analyze import analyze_engine
 from agent.nodes.origin_v1 import run_origin_v1
 from agent.nodes.report import write_report_node
@@ -26,7 +31,7 @@ def build_origin_v1_graph() -> StateGraph:
 def build_graph_v1() -> StateGraph:
     """graph-v1: engine collect → engine analyze → report"""
     graph = StateGraph(DiagnosisState)
-    graph.add_node("collect", run_cli_workflow)
+    graph.add_node("collect", collect_materials)
     graph.add_node("analyze", analyze_engine)
     graph.add_node("report", write_report_node)
     graph.add_edge(START, "collect")
@@ -47,9 +52,8 @@ def _build_checkpointer():
 checkpointer = _build_checkpointer()
 
 GRAPHS = {
-    "origin-v1":    build_origin_v1_graph().compile(checkpointer=checkpointer),
-    "origin-split": build_graph_v1().compile(checkpointer=checkpointer),                      # engine 子函数拆分
-    "graph-v1":     build_graph_v1().compile(checkpointer=checkpointer),                      # graph后续(同split)
+    "origin-v1": build_origin_v1_graph().compile(checkpointer=checkpointer),
+    "graph-v1": build_graph_v1().compile(checkpointer=checkpointer),
 }
 
 app = GRAPHS["graph-v1"]

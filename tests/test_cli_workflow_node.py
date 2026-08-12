@@ -5,6 +5,8 @@ import unittest
 from pathlib import Path
 
 from agent.nodes.origin_v1 import run_origin_v1
+
+
 class CliWorkflowNodeTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_material_runs_complete_migrated_workflow(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

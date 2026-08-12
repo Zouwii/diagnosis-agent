@@ -1,65 +1,34 @@
-"""Material collection node shared by all four diagnosis entry paths."""
+"""graph-v1 collection node and Engine request adapter."""
 
 from __future__ import annotations
 
-import asyncio
-import os
-import re
-import uuid
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
 from agent.logger import log
 from agent.state import DiagnosisState
-from engine.collectors import CollectionDestination, CollectionRequest, collect
-from engine.utils import append_event, now_iso, write_json
+from engine.utils import now_iso, write_json
+from engine.workflows import RunCaseRequest, run_case
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SUPPORTED_SOURCES = {"tb_task", "internal_robot", "remote_site", "local_logs"}
-CASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-
-
-def _cases_root() -> Path:
-    configured = os.environ.get("DIAGNOSIS_CASES_DIR", "").strip()
-    return Path(configured).expanduser() if configured else PROJECT_ROOT / "data" / "cases"
-
-
-def _resolve_case_id(state: DiagnosisState) -> str:
-    case_id = str(state.get("case_id") or "").strip()
-    if not case_id:
-        return f"case-{uuid.uuid4().hex[:12]}"
-    if not CASE_ID_PATTERN.fullmatch(case_id):
-        raise ValueError("case_id may only contain letters, numbers, '.', '_' and '-'")
-    return case_id
-
-
-def _resolve_case_dir(state: DiagnosisState, case_id: str) -> Path:
-    assigned = str(state.get("case_dir") or "").strip()
-    if not assigned:
-        return _cases_root() / case_id
-    case_dir = Path(assigned).expanduser().resolve()
-    if case_dir.name != case_id:
-        raise ValueError("assigned case_dir does not match case_id")
-    return case_dir
 
 
 def _task_id(params: dict[str, Any]) -> str:
     explicit = str(params.get("task_id") or "").strip()
     if explicit:
         return explicit
-
     task_url = str(params.get("task_url") or "").strip()
     if not task_url:
         return ""
     parsed = urlparse(task_url)
     query = parse_qs(parsed.query)
     for key in ("taskId", "task_id", "id"):
-        value = query.get(key, [])
-        if value and value[0].strip():
-            return value[0].strip()
-
+        values = query.get(key, [])
+        if values and values[0].strip():
+            return values[0].strip()
     segments = [unquote(segment).strip() for segment in parsed.path.split("/") if segment.strip()]
     if "task" in segments:
         index = len(segments) - 1 - segments[::-1].index("task")
@@ -68,129 +37,94 @@ def _task_id(params: dict[str, Any]) -> str:
     return segments[-1] if segments else ""
 
 
-def _collection_request(
-    source_type: str,
-    params: dict[str, Any],
-    raw_dir: Path,
-    extracted_dir: Path,
-    input_roots: list[str] | None = None,
-) -> CollectionRequest:
+def _validate_local_path(state: DiagnosisState, params: dict[str, Any]) -> None:
+    if state.get("source_type") != "local_logs":
+        return
     log_path = str(params.get("log_path") or "").strip()
-    if source_type == "local_logs" and log_path and input_roots:
-        resolved_log = Path(log_path).expanduser().resolve()
-        resolved_roots = [Path(root).expanduser().resolve() for root in input_roots if str(root).strip()]
-        if not any(resolved_log.is_relative_to(root) for root in resolved_roots):
-            raise ValueError("local log path is outside the tenant's allowed input directories")
-        log_path = str(resolved_log)
-    return CollectionRequest(
+    roots = [str(root).strip() for root in state.get("input_roots", []) if str(root).strip()]
+    legacy_root = str(state.get("input_root") or "").strip()
+    if legacy_root and legacy_root not in roots:
+        roots.append(legacy_root)
+    if not log_path or not roots:
+        return
+    resolved = Path(log_path).expanduser().resolve()
+    allowed = [Path(root).expanduser().resolve() for root in roots]
+    if not any(resolved.is_relative_to(root) for root in allowed):
+        raise ValueError("local log path is outside the tenant's allowed input directories")
+
+
+def _request_from_state(state: DiagnosisState) -> RunCaseRequest:
+    source_type = str(state.get("source_type") or "").strip()
+    if source_type not in SUPPORTED_SOURCES:
+        raise ValueError(f"unsupported source_type: {source_type or 'empty'}")
+    case_id = str(state.get("case_id") or "").strip()
+    case_dir = Path(str(state.get("case_dir") or "")).expanduser().resolve()
+    if not case_id or not str(state.get("case_dir") or "").strip():
+        raise ValueError("case_id and case_dir are required")
+    if case_dir.name != case_id:
+        raise ValueError("assigned case_dir does not match case_id")
+
+    params = dict(state.get("extra_params") or {})
+    _validate_local_path(state, params)
+    return RunCaseRequest(
+        case_id=case_id,
+        case_dir=case_dir,
         source_type=source_type,
-        destination=CollectionDestination(raw_dir=raw_dir, extracted_dir=extracted_dir),
+        symptom=str(state.get("symptom") or state.get("user_input") or "").replace("None", ""),
+        time_window=str(state.get("time_window") or ""),
         task_id=_task_id(params),
-        robot_ip=str(params.get("robot_ip") or "").strip(),
-        frp_port=str(params.get("frp_port") or "").strip(),
-        site_robot_ip=str(params.get("site_robot_ip") or "").strip(),
-        log_path=log_path,
+        task_url=str(params.get("task_url") or ""),
+        robot_ip=str(params.get("robot_ip") or ""),
+        frp_port=str(params.get("frp_port") or ""),
+        site_robot_ip=str(params.get("site_robot_ip") or ""),
+        log_path=str(params.get("log_path") or ""),
+        artifacts=[str(item) for item in params.get("artifacts", [])],
+        knowledge_sources=[str(item) for item in params.get("knowledge_sources", [])],
+        code_sources=[str(item) for item in params.get("code_sources", [])],
         collect_remote=params.get("collect_remote") is not False,
         allow_large_downloads=params.get("allow_large_downloads") is True,
         allow_all_attachments=params.get("allow_all_attachments") is True,
+        analyze=True,
+        external_evidence=params.get("external_evidence") is not False,
     )
 
 
-async def collect_data(state: DiagnosisState) -> DiagnosisState:
-    """Dispatch collection and expose one stable material contract downstream."""
-    source_type = str(state.get("source_type") or "")
-    selected_skill = str(state.get("selected_skill") or "")
-    collected_at = now_iso()
-    case_id = ""
-    case_dir: Path | None = None
-    log("collect_data", "采集开始", source_type=source_type or "?")
+async def collect_materials(state: DiagnosisState) -> DiagnosisState:
+    """Collect materials only — LLM analysis happens in the next node."""
+    request = _request_from_state(state)
+    # graph-v1 uses this node for collection only. RunCaseRequest is frozen,
+    # so derive a modified request instead of mutating it in place.
+    request = replace(request, analyze=False, external_evidence=False)
 
-    try:
-        if source_type not in SUPPORTED_SOURCES:
-            raise ValueError(f"unsupported or unresolved source_type: {source_type or 'empty'}")
+    log("collect", "开始采集", source_type=request.source_type, case_id=request.case_id)
 
-        case_id = _resolve_case_id(state)
-        case_dir = _resolve_case_dir(state, case_id)
-        raw_dir = case_dir / "raw"
-        extracted_dir = case_dir / "extracted"
-        raw_dir.mkdir(parents=True, exist_ok=True)
-        extracted_dir.mkdir(parents=True, exist_ok=True)
+    result = run_case(request, external_enricher=None)
 
-        params = dict(state.get("extra_params") or {})
-        input_roots = list(state.get("input_roots") or [])
-        legacy_input_root = str(state.get("input_root") or "").strip()
-        if legacy_input_root and legacy_input_root not in input_roots:
-            input_roots.append(legacy_input_root)
-        request = _collection_request(
-            source_type,
-            params,
-            raw_dir,
-            extracted_dir,
-            input_roots=input_roots,
-        )
-        result = await asyncio.to_thread(collect, request)
+    context = result.context
+    collection = result.collection
+    case_dir = request.case_dir
+    materials = {
+        "collected": True,
+        "source": request.source_type,
+        "case_id": request.case_id,
+        "case_dir": str(case_dir),
+        "raw_dir": str(case_dir / "raw"),
+        "extracted_dir": str(case_dir / "extracted"),
+        "artifacts": list(collection.artifacts),
+        "warnings": list(collection.warnings),
+        "metadata": {
+            **collection.metadata,
+            "collection_skill": str(state.get("selected_skill") or ""),
+        },
+    }
+    write_json(case_dir / "collection.json", {**materials, "collected_at": now_iso()})
 
-        materials: dict[str, Any] = {
-            "collected": True,
-            "source": source_type,
-            "case_id": case_id,
-            "case_dir": str(case_dir),
-            "raw_dir": str(raw_dir),
-            "extracted_dir": str(extracted_dir),
-            "artifacts": result.artifacts,
-            "warnings": result.warnings,
-            "metadata": {**result.metadata, "collection_skill": selected_skill},
-        }
-        write_json(case_dir / "collection.json", {**materials, "collected_at": collected_at})
-        append_event(
-            case_dir,
-            "materials_collected",
-            {
-                "source_type": source_type,
-                "collection_skill": selected_skill,
-                "artifact_count": len(result.artifacts),
-                "warning_count": len(result.warnings),
-            },
-        )
-        log(
-            "collect_data",
-            "采集完成",
-            source=source_type,
-            case_id=case_id,
-            artifacts=len(result.artifacts),
-            warnings=len(result.warnings),
-        )
-        return {"case_id": case_id, "materials": materials, "collected_at": collected_at}
-    except Exception as exc:
-        message = f"{source_type or 'unknown'} collection failed: {exc}"
-        materials: dict[str, Any] = {
-            "collected": False,
-            "source": source_type,
-            "artifacts": [],
-            "warnings": [],
-            "metadata": {},
-            "error": str(exc),
-        }
-        if case_dir is not None:
-            materials.update(
-                {
-                    "case_id": case_id,
-                    "case_dir": str(case_dir),
-                    "raw_dir": str(case_dir / "raw"),
-                    "extracted_dir": str(case_dir / "extracted"),
-                }
-            )
-            try:
-                write_json(case_dir / "collection.json", {**materials, "collected_at": collected_at})
-                append_event(case_dir, "materials_collection_failed", {"source_type": source_type, "error": str(exc)})
-            except OSError as persist_error:
-                log("collect_data", "失败状态持久化失败", error=str(persist_error))
-        log("collect_data", "采集失败", source=source_type or "?", error=str(exc))
-        update: DiagnosisState = {
-            "materials": materials,
-            "collected_at": collected_at,
-            "errors": [message],
-        }
-        if case_id:
-            update["case_id"] = case_id
-        return update
+    update: DiagnosisState = {
+        "materials": materials,
+        "collected_at": str(context.get("created_at") or now_iso()),
+        "context": context,
+        "findings": [],
+        "error_codes": [],
+    }
+    log("collect", "采集完成", case_id=request.case_id, artifacts=len(collection.artifacts))
+    return update

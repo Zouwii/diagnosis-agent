@@ -17,7 +17,7 @@ class GraphTopologyTests(unittest.TestCase):
         )
 
     def test_all_public_graph_versions_are_registered(self) -> None:
-        self.assertEqual(set(GRAPHS), {"origin-v1", "origin-split", "graph-v1"})
+        self.assertEqual(set(GRAPHS), {"origin-v1", "graph-v1"})
 
 
 if __name__ == "__main__":

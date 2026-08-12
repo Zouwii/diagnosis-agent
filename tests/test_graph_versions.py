@@ -12,12 +12,11 @@ class GraphVersionTests(unittest.TestCase):
             {"diagnosis_cli"},
         )
 
-    def test_split_versions_keep_their_three_stage_shape(self) -> None:
-        for version in ("origin-split", "graph-v1"):
-            self.assertEqual(
-                {name for name in GRAPHS[version].nodes if name not in {"__start__", "__end__"}},
-                {"collect", "analyze", "report"},
-            )
+    def test_graph_v1_has_a_three_stage_shape(self) -> None:
+        self.assertEqual(
+            {name for name in GRAPHS["graph-v1"].nodes if name not in {"__start__", "__end__"}},
+            {"collect", "analyze", "report"},
+        )
 
 
 if __name__ == "__main__":

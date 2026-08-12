@@ -2,9 +2,6 @@
 langgraph>=0.2.0
 langgraph-checkpoint>=2.0
 
-# 模型路由
-litellm>=1.50
-
 # Web 服务
 fastapi>=0.115
 uvicorn[standard]>=0.30
@@ -12,7 +9,6 @@ sse-starlette>=2.0
 
 # 数据库 (checkpoint 持久化)
 psycopg2-binary>=2.9
-sqlalchemy>=2.0
 
 # 工具
 pyyaml>=6.0

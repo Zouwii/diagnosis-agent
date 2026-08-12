@@ -31,12 +31,12 @@ _cases: dict[str, dict] = {}
 
 class CreateCaseRequest(BaseModel):
     mode: Literal["internal_robot", "tb_task", "remote_site", "local_logs"]
-    version: Literal["claude-origin-v1", "origin-v1", "origin-split", "graph-v1"] = Field(
+    version: Literal["origin-v1", "graph-v1"] = Field(
         default_factory=lambda: (
-            os.getenv("DIAGNOSIS_DEFAULT_RUNTIME", "claude-origin-v1").strip()
-            if os.getenv("DIAGNOSIS_DEFAULT_RUNTIME", "claude-origin-v1").strip()
-            in {"claude-origin-v1", "origin-v1", "origin-split", "graph-v1"}
-            else "claude-origin-v1"
+            os.getenv("DIAGNOSIS_DEFAULT_RUNTIME", "graph-v1").strip()
+            if os.getenv("DIAGNOSIS_DEFAULT_RUNTIME", "graph-v1").strip()
+            in {"origin-v1", "graph-v1"}
+            else "graph-v1"
         )
     )
     # 按来源二选一

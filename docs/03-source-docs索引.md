@@ -149,7 +149,9 @@ source-docs/
 | 加载器 | 加载目录 | 内容 |
 |---|---|---|
 | `knowledge/playbook_loader.py` | `source-docs/jstate_error_codes/agent/` | 54 个 Playbook YAML |
-| `knowledge/topk_loader.py` | 硬编码路径指向 management-system `docs/error-code-system/` | B 类文档关键词匹配 |
+
+旧 `knowledge/topk_loader.py` 因依赖已删除的 management-system 硬编码目录而移除。现场高频
+问题后续由 graph-v1 的显式症状路由读取本仓库 `source-docs/onsite-top/`。
 
 ### 4.2 更新流程
 

@@ -8,7 +8,7 @@ collection, analysis, evidence, and reporting behavior.
 from __future__ import annotations
 
 from agent.logger import log
-from agent.nodes.run_cli import _request_from_state
+from agent.nodes.collect import _request_from_state
 from agent.state import DiagnosisState
 from engine.analysis.external_providers import enrich_with_external_evidence
 from engine.utils import now_iso, write_json
