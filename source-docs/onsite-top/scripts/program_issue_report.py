@@ -50,7 +50,7 @@ def fetch_records(conn, start, end, executor_id):
     cursor = conn.cursor()
     cursor.execute("""
         SELECT task_id, content, raw_json, created_at_ding,
-               problem_type_level_1, problem_type_level_2, problem_type_level_3,
+               problem_type_1, problem_type_2,
                cause_level_1, cause_level_2, cause_level_3, software_version
         FROM program_issue_detail
         WHERE created_at_ding >= %s AND created_at_ding < %s AND executor_id = %s
@@ -59,9 +59,9 @@ def fetch_records(conn, start, end, executor_id):
     rows = cursor.fetchall()
     cursor.close()
     records = []
-    for number, (task_id, content, raw, created, type1, type2, type3, cause1, cause2, cause3, software_version) in enumerate(rows, 1):
+    for number, (task_id, content, raw, created, type1, type2, cause1, cause2, cause3, software_version) in enumerate(rows, 1):
         tags = parse_customfields(raw)
-        problem_type_levels = [x for x in (type1, type2, type3) if x]
+        problem_type_levels = [x for x in (type1, type2) if x]
         cause_levels = [x for x in (cause1, cause2, cause3) if x]
         records.append({
             "num": number,

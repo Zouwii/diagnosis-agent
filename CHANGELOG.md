@@ -17,7 +17,7 @@
 
 - 6001 仅保留 `origin-v1` 兼容基线与 `graph-v1` 结构化工作流。
 - 移除 `claude-origin-v1`、`origin-split`、旧多 Agent 模型路由和重复采集节点。
-- 5433 Claude CLI + ttyd 实现迁移到 `legacy/ttyd-5433/`，不再进入 6001 部署包。
+- 5433 Claude CLI + ttyd 代码归还 management-system 管理，diagnosis-agent 不再保留副本。
 - 删除失效的 TopK 硬编码加载器、手工网络测试和未使用 Skill 快照。
 - 重写架构、任务和开发文档，统一一期目标为“诊断流程结构化与可控化”。
 

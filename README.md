@@ -101,7 +101,7 @@ legacy/         不属于 6001 主线的历史实现
 - 6001 不启动或托管 Claude CLI/ttyd。
 - 不保留 `claude-origin-v1`、`origin-split` 等重复运行版本。
 - 不建设多 Agent fan-out、辩论或仲裁。
-- 5433 ttyd 历史实现仅保存在 `legacy/ttyd-5433/` 供参考。
+- 5433 ttyd 的运行与维护代码归属 `management-system/backend/ai/terminal/`；本仓库不保留副本。
 - 原始知识和 Engine 保留，graph-v1 在其上做结构化编排，而不是重新实现所有诊断逻辑。
 
 详细设计见 [LangGraph V1 架构设计](docs/04-Agent-Harness架构演进设计.md)。
